@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="fa">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>گروه تحقیقاتی پوریا — [نام موقت گروه]</title>
+  <meta name="description" content="گروه تحقیقاتی دکتری — پروژه‌ها، ایده‌ها و مقالات بازبینی‌شده." />
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { direction: rtl; font-family: Vazirmatn, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background:#f7f9fc; }
+    .hero { padding: 4rem 1rem; background: linear-gradient(180deg,#ffffff, #eef4ff); border-radius: 12px; box-shadow: 0 6px 18px rgba(20,30,60,0.06); }
+    .card { border:0; }
+    footer { font-size:0.85rem; color:#666; padding:1.5rem 0; }
+    .tag { font-size:0.78rem; }
+  </style>
+</head>
+<body>
+  <div class="container py-4">
+    <header class="mb-4 d-flex justify-content-between align-items-center">
+      <div>
+        <h1 class="h3 mb-0">گروه تحقیقاتی [نام گروه]</h1>
+        <div class="text-muted">دکترای پژوهشی — پوریا (PhD student)</div>
+      </div>
+      <nav>
+        <a href="#projects" class="me-3">پروژه‌ها</a>
+        <a href="#ideas" class="me-3">ایده‌ها</a>
+        <a href="#papers" class="me-3">مقالات</a>
+        <a href="#contact">تماس</a>
+      </nav>
+    </header>
+
+    <section class="hero mb-4">
+      <div class="row align-items-center">
+        <div class="col-md-8">
+          <h2>خوش آمدید — آزمایشگاه فیزیکی هنوز در راه است، اما پژوهش تعطیل نیست.</h2>
+          <p class="lead">اینجا محل درج پروژه‌ها، یادداشت‌های فکری، پیش‌پایان‌نامه‌ها و نقدهای ماست. همهٔ محتوا با هدف شفافیت پژوهشی و به اشتراک‌گذاری سریع منتشر می‌شود.</p>
+          <p class="mb-0"><span class="badge bg-primary tag">ORCID: <a href="#" target="_blank" class="text-white text-decoration-underline">0000-0000-0000-0000</a></span></p>
+        </div>
+        <div class="col-md-4 text-md-end mt-3 mt-md-0">
+          <img src="https://via.placeholder.com/160x160?text=Logo" alt="logo" class="rounded" />
+        </div>
+      </div>
+    </section>
+
+    <section id="projects" class="mb-4">
+      <h3>پروژه‌های جاری</h3>
+      <div class="row g-3">
+        <div class="col-md-6">
+          <div class="card p-3">
+            <h5>پروژه ۱ — عنوان کوتاه</h5>
+            <p class="small text-muted">خلاصه: یک یا دو خط درباره هدف، روش و وضعیت (درحال اجرا / پیش‌نویس / منتشر شده).</p>
+            <p class="mb-0"><a href="#" class="link-primary">جزئیات / کد / داده‌ها</a></p>
+          </div>
+        </div>
+        <div class="col-md-6">
+          <div class="card p-3">
+            <h5>پروژه ۲ — عنوان کوتاه</h5>
+            <p class="small text-muted">خلاصه: نکات آزمایشی یا تئوریک و وضعیت فعلی.</p>
+            <p class="mb-0"><a href="#" class="link-primary">جزئیات / یادداشت</a></p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="ideas" class="mb-4">
+      <h3>ایده‌ها و یادداشت‌ها</h3>
+      <ul class="list-group">
+        <li class="list-group-item">ایده A — خلاصهٔ 1-2 خطی. <span class="text-muted">[پیش‌طرح]</span></li>
+        <li class="list-group-item">ایده B — خلاصه. <span class="text-muted">[بحث‌شده]</span></li>
+      </ul>
+    </section>
+
+    <section id="papers" class="mb-4">
+      <h3>مقالات و بررسی‌ها</h3>
+      <div class="list-group">
+        <a href="#" class="list-group-item list-group-item-action">
+          <div class="d-flex w-100 justify-content-between">
+            <h5 class="mb-1">عنوان مقاله یا نقد</h5>
+            <small class="text-muted">افزایش: 2025</small>
+          </div>
+          <p class="mb-1 small text-muted">خلاصه یا نتیجهٔ کلیدی. لینک به PDF یا DOI.</p>
+        </a>
+      </div>
+      <p class="mt-2 small text-muted">پیشنهاد: برای انتشار نسخهٔ پایدار مقاله‌ها از Zenodo (دریافت DOI) استفاده کنید.</p>
+    </section>
+
+    <section id="resources" class="mb-4">
+      <h3>منابع و کد</h3>
+      <p class="small text-muted">چک‌لیست: مخزن GitHub برای کد، Zenodo برای آرشیو، README کامل با دستورالعمل اجرا، و فایل `CITATION.cff` برای ارجاع‌دهی.</p>
+    </section>
+
+    <section id="contact" class="mb-4">
+      <h3>تماس</h3>
+      <p class="small">ایمیل: <a href="mailto:your.email@example.com">your.email@example.com</a></p>
+      <p class="small">احتمالاً بهتر است لینک ORCID، Google Scholar و LinkedIn را اینجا بگذارید.</p>
+    </section>
+
+    <footer class="text-center">
+      <div>© 2025 گروه تحقیقاتی [نام گروه] — محتوا ممکن است تحت <strong>CC BY 4.0</strong> منتشر شود.</div>
+    </footer>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
