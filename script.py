@@ -286,7 +286,7 @@ fwd_fixed = mne.convert_forward_solution(
 )
 LEAD_FIELD = np.asarray(fwd_fixed["sol"]["data"], dtype=np.float32)
 N_CHANNELS, N_VERTICES = LEAD_FIELD.shape
-N_TIMES = int(round(CFG.duration_s * CFG.sfreq)) + 1
+N_TIMES = int(round(CFG.duration_s * CFG.sfreq))
 COORDINATES_MM = np.vstack([
     src["rr"][src["vertno"]] for src in fwd_fixed["src"]
 ]).astype(np.float32) * 1000.0
