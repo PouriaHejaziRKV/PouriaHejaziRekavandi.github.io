@@ -10,8 +10,9 @@
 
 # %% 0 — INSTALL IN A SEPARATE COLAB CELL
 # RUN THIS CELL BEFORE THE REST OF THE SCRIPT
-# !pip install -q esinet mne pandas seaborn matplotlib scikit-learn
-# !pip install -q torch-geometric pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
+# import IPython
+# print("Installing dependencies...")
+# IPython.get_ipython().system('pip install -q esinet mne pandas seaborn matplotlib scikit-learn torch-geometric')
 
 # %% 1 — IMPORTS AND GOOGLE DRIVE
 from __future__ import annotations
@@ -104,6 +105,17 @@ MNE_ROOT = os.path.join(DRIVE_ROOT, "mne_data")
 OUTPUT_DIR = os.path.join(DRIVE_ROOT, "real_mne_sample_final")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+TIKHONOV_CNN_PATH = os.path.join(OUTPUT_DIR, "best_tikhonov_cnn_model.pt")
+GRAPH_MODEL_PATH = os.path.join(OUTPUT_DIR, "best_sparse_st_graph_model.pt")
+PHYSICS_GAT_PATH = os.path.join(OUTPUT_DIR, "best_full_physics_gat_model.pt")
+CONVDIP_MODEL_PATH = os.path.join(OUTPUT_DIR, "convdip_real_subject_model")
+
+TRAINING_HISTORY_PATH = os.path.join(OUTPUT_DIR, "sparse_graph_training_history.csv")
+REAL_RESULTS_PATH = os.path.join(OUTPUT_DIR, "real_data_results.csv")
+REAL_TIMING_PATH = os.path.join(OUTPUT_DIR, "real_data_inference_times.csv")
+CONFIG_PATH = os.path.join(OUTPUT_DIR, "configuration.json")
+SYNTHETIC_RESULTS_PATH = os.path.join(OUTPUT_DIR, "synthetic_results.csv")
+
 # ------------------------------------------------------------
 # Source-space and simulation settings
 # ------------------------------------------------------------
@@ -115,11 +127,16 @@ OOD_SNR = -10.0
 SOURCE_EXTENTS = (10, 20)
 OOD_EXTENTS = (28, 42)
 
+NUM_SIMULATED_SOURCES = 3
+OOD_NUM_SIMULATED_SOURCES = 6
+
 N_TRAIN = 8 if SMOKE_TEST else 40000
 N_VALIDATION = 4 if SMOKE_TEST else 1000
 N_TEST = 4 if SMOKE_TEST else 1000
 
 SIMULATION_DURATION = 0.30
+RESAMPLE_FREQUENCY = 100.0
+N_TIMES = int(round(SIMULATION_DURATION * RESAMPLE_FREQUENCY)) + 1
 
 MAX_EPOCHS = 1 if SMOKE_TEST else 150
 BATCH_SIZE = 2 if SMOKE_TEST else 64
@@ -138,7 +155,6 @@ EPOCH_TMIN = -0.20
 EPOCH_TMAX = 0.50
 INFERENCE_TMIN = 0.00
 INFERENCE_TMAX = 0.30
-RESAMPLE_FREQUENCY = 100.0
 
 NONLOCAL_K = 4
 FUNCTIONAL_K = 3
@@ -400,32 +416,8 @@ STATIC_GRAPH_BUILDER = GraphBuilder(lead_field, dynamic=False)
 DYNAMIC_GRAPH_BUILDER = GraphBuilder(lead_field, dynamic=True)
 
 # ============================================================
-# 9. CREATE SUBJECT-SPECIFIC TRAINING SIMULATIONS
+# 9. EXTRACTION UTILITIES
 # ============================================================
-def make_simulation(n_samples, seed, snr, extents, sources=3):
-    set_global_seed(seed)
-    settings = {"duration_of_trial": SIMULATION_DURATION, "number_of_sources": sources, "extents": extents, "target_snr": snr}
-    simulation = Simulation(fwd_fixed, epochs.info.copy(), settings=settings)
-    simulation.simulate(n_samples=n_samples)
-    return simulation
-
-sim_train = make_simulation(N_TRAIN, SEEDS[0], TARGET_SNR, SOURCE_EXTENTS, sources=NUM_SIMULATED_SOURCES)
-sim_validation = make_simulation(N_VALIDATION, SEEDS[0] + 1, TARGET_SNR, SOURCE_EXTENTS, sources=NUM_SIMULATED_SOURCES)
-
-# Independent Test Sets
-sim_test_id = make_simulation(N_TEST, SEEDS[0] + 100, TARGET_SNR, SOURCE_EXTENTS, sources=NUM_SIMULATED_SOURCES)
-sim_test_ood_snr = make_simulation(N_TEST, SEEDS[0] + 101, OOD_SNR, SOURCE_EXTENTS, sources=NUM_SIMULATED_SOURCES)
-sim_test_ood_extent = make_simulation(N_TEST, SEEDS[0] + 102, TARGET_SNR, OOD_EXTENTS, sources=NUM_SIMULATED_SOURCES)
-sim_test_ood_sources = make_simulation(N_TEST, SEEDS[0] + 103, TARGET_SNR, SOURCE_EXTENTS, sources=6)
-
-# ============================================================
-# 10. DATA EXTRACTION UTILITIES
-# ============================================================
-def convert_to_list(data):
-    if isinstance(data, list): return data
-    if isinstance(data, tuple): return list(data)
-    return [data[index] for index in range(len(data))]
-
 def extract_array(item):
     if hasattr(item, "get_data"): return np.asarray(item.get_data())
     if hasattr(item, "data"): return np.asarray(item.data)
@@ -437,131 +429,23 @@ def ensure_two_dimensions(array):
     return array.astype(np.float32, copy=False)
 
 def extract_eeg_collection(data):
-    output = []
-    for item in convert_to_list(data):
-        output.append(ensure_two_dimensions(extract_array(item)))
-    return np.stack(output, axis=0)
+    if isinstance(data, list) or isinstance(data, tuple):
+        return np.stack([ensure_two_dimensions(extract_array(data[i])) for i in range(len(data))], axis=0)
+    return np.stack([ensure_two_dimensions(extract_array(data))], axis=0)
 
 def extract_source_full(data):
-    output = []
-    for item in convert_to_list(data):
-        source_data = ensure_two_dimensions(extract_array(item))
-        output.append(source_data)
-    return np.stack(output, axis=0).astype(np.float32)
+    if isinstance(data, list) or isinstance(data, tuple):
+        return np.stack([ensure_two_dimensions(extract_array(data[i])) for i in range(len(data))], axis=0).astype(np.float32)
+    return np.stack([ensure_two_dimensions(extract_array(data))], axis=0).astype(np.float32)
 
-X_eeg_train = extract_eeg_collection(sim_train.eeg_data)
-Y_source_train = extract_source_full(sim_train.source_data)
-X_eeg_validation = extract_eeg_collection(sim_validation.eeg_data)
-Y_source_validation = extract_source_full(sim_validation.source_data)
-
-# Extract test sets
 def extract_test(sim):
     return extract_eeg_collection(sim.eeg_data), extract_source_full(sim.source_data)
 
-X_eeg_test_id, Y_source_test_id = extract_test(sim_test_id)
-X_eeg_test_ood_snr, Y_source_test_ood_snr = extract_test(sim_test_ood_snr)
-X_eeg_test_ood_extent, Y_source_test_ood_extent = extract_test(sim_test_ood_extent)
-X_eeg_test_ood_sources, Y_source_test_ood_sources = extract_test(sim_test_ood_sources)
-
-N_TIMES = Y_source_train.shape[-1]
-if X_eeg_train.shape[-1] != N_TIMES: raise RuntimeError(f"Unexpected EEG time dimension: expected {N_TIMES}, received {X_eeg_train.shape[-1]}")
-
-assert_finite_array("X_eeg_train", X_eeg_train)
-assert_finite_array("Y_source_train", Y_source_train)
-
-# Clean memory
-del sim_validation, sim_test_id, sim_test_ood_snr, sim_test_ood_extent, sim_test_ood_sources
-gc.collect()
-
 # ============================================================
-# 11. REGULARIZED TIKHONOV INVERSE
-# ============================================================
-def compute_tikhonov_inverse(forward_matrix, relative_regularization):
-    K = np.asarray(forward_matrix, dtype=np.float64)
-    sensor_gram = K @ K.T
-    average_eigenvalue = np.trace(sensor_gram) / sensor_gram.shape[0]
-    regularization = relative_regularization * average_eigenvalue
-    regularized_gram = sensor_gram + regularization * np.eye(sensor_gram.shape[0])
-    inverse_operator = K.T @ np.linalg.solve(regularized_gram, np.eye(regularized_gram.shape[0]))
-    return inverse_operator.astype(np.float32), float(regularization)
-
-K_dagger, effective_regularization = compute_tikhonov_inverse(lead_field, TIKHONOV_RELATIVE_REGULARIZATION)
-
-def apply_tikhonov_batch(eeg_batch, inverse_operator):
-    return np.einsum("vc,bct->bvt", inverse_operator, eeg_batch, optimize=True).astype(np.float32)
-
-X_source_train = apply_tikhonov_batch(X_eeg_train, K_dagger)
-X_source_validation = apply_tikhonov_batch(X_eeg_validation, K_dagger)
-X_source_test_id = apply_tikhonov_batch(X_eeg_test_id, K_dagger)
-X_source_test_ood_snr = apply_tikhonov_batch(X_eeg_test_ood_snr, K_dagger)
-X_source_test_ood_extent = apply_tikhonov_batch(X_eeg_test_ood_extent, K_dagger)
-X_source_test_ood_sources = apply_tikhonov_batch(X_eeg_test_ood_sources, K_dagger)
-
-# ============================================================
-# 12. TRAIN-ONLY NORMALIZATION
-# ============================================================
-def robust_scale(array, percentile=99.5):
-    value = np.percentile(np.abs(array), percentile)
-    return float(max(value, 1e-12))
-
-X_INPUT_SCALE = robust_scale(X_source_train)
-Y_TARGET_SCALE = robust_scale(Y_source_train)
-
-X_source_train = np.clip(X_source_train / X_INPUT_SCALE, -10.0, 10.0).astype(np.float32)
-X_source_validation = np.clip(X_source_validation / X_INPUT_SCALE, -10.0, 10.0).astype(np.float32)
-X_source_test_id = np.clip(X_source_test_id / X_INPUT_SCALE, -10.0, 10.0).astype(np.float32)
-
-Y_source_train = np.clip(Y_source_train / Y_TARGET_SCALE, -10.0, 10.0).astype(np.float32)
-Y_source_validation = np.clip(Y_source_validation / Y_TARGET_SCALE, -10.0, 10.0).astype(np.float32)
-Y_source_test_id = np.clip(Y_source_test_id / Y_TARGET_SCALE, -10.0, 10.0).astype(np.float32)
-
-# ============================================================
-# 13. DATA LOADERS (USING PYTORCH GEOMETRIC BATCHING)
-# ============================================================
-class PhysicsDataset(Dataset):
-    def __init__(self, x_data, y_data, build_dynamic_graph=False):
-        self.x = x_data
-        self.y = y_data
-        self.build_dynamic_graph = build_dynamic_graph
-        self.cache = {}
-
-    def __len__(self): return len(self.x)
-
-    def __getitem__(self, idx):
-        source_ts = self.x[idx]
-        target = self.y[idx]
-
-        if self.build_dynamic_graph:
-            if idx not in self.cache:
-                edge_index, edge_attr = DYNAMIC_GRAPH_BUILDER(source_ts)
-                self.cache[idx] = (edge_index, edge_attr)
-            else:
-                edge_index, edge_attr = self.cache[idx]
-        else:
-            edge_index, edge_attr = None, None
-
-        return Data(
-            x=torch.from_numpy(source_ts),
-            y=torch.from_numpy(target),
-            edge_index=edge_index,
-            edge_attr=edge_attr
-        )
-
-# Graph datasets use PyGDataLoader, CNN uses standard
-train_dataset_graph = PhysicsDataset(X_source_train, Y_source_train, build_dynamic_graph=True)
-val_dataset_graph = PhysicsDataset(X_source_validation, Y_source_validation, build_dynamic_graph=True)
-
-train_loader_graph = PyGDataLoader(train_dataset_graph, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-val_loader_graph = PyGDataLoader(val_dataset_graph, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-
-train_loader_cnn = PyGDataLoader(PhysicsDataset(X_source_train, Y_source_train, build_dynamic_graph=False), batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-val_loader_cnn = PyGDataLoader(PhysicsDataset(X_source_validation, Y_source_validation, build_dynamic_graph=False), batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-
-# ============================================================
-# 14. NEURAL ARCHITECTURES
+# 10. NEURAL ARCHITECTURES
 # ============================================================
 
-# 14A. TikhonovTemporalCNN
+# 10A. TikhonovTemporalCNN
 class TikhonovTemporalCNN(nn.Module):
     def __init__(self, hidden=32):
         super().__init__()
@@ -587,7 +471,7 @@ class TikhonovTemporalCNN(nn.Module):
         output = self.temporal_decoder(features)
         return output.reshape(batch_size, vertices, -1)
 
-# 14B. Sparse Spatio-Temporal Graph Network
+# 10B. Sparse Spatio-Temporal Graph Network
 class SparseSpatioTemporalGraphNet(nn.Module):
     def __init__(self, hidden_dimension=32, dropout=0.20):
         super().__init__()
@@ -644,7 +528,7 @@ class SparseSpatioTemporalGraphNet(nn.Module):
         output = self.temporal_decoder(hidden)
         return output
 
-# 14C. Full Physics GAT
+# 10C. Full Physics GAT
 class TemporalEncoderPhysics(nn.Module):
     def __init__(self, hidden):
         super().__init__()
@@ -690,22 +574,20 @@ class FullPhysicsGAT(nn.Module):
 
     def forward(self, data, *args):
         initial_source, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
-        # initial_source: [B*V, T] natively flattened by PyG Batching
         features = self.temporal_encoder(initial_source)
         features = self.graph_block_1(features, edge_index, edge_attr)
         features = self.graph_block_2(features, edge_index, edge_attr)
-        output = self.temporal_decoder(features) # [B*V, T]
-        # reshape back to [B, V, T]
+        output = self.temporal_decoder(features)
         batch_size = batch.max().item() + 1
         return output.reshape(batch_size, num_vertices, -1)
 
 # ============================================================
-# 15. LOSS TENSORS
+# 11. LOSS TENSORS
 # ============================================================
 GEODESIC_TENSOR = torch.tensor(GEODESIC_MM, dtype=torch.float32, device=device)
 LEAD_FIELD_TENSOR = torch.tensor(lead_field, dtype=torch.float32, device=device)
 
-def graph_training_loss(prediction, target, graph_edges, active_weight, active_threshold_ratio, spatial_weight, forward_weight=1.0):
+def graph_training_loss(prediction, target, eeg_target, graph_edges, active_weight, active_threshold_ratio, spatial_weight, forward_weight=1.0):
     if prediction.shape != target.shape: raise ValueError(f"Prediction shape {prediction.shape} does not match target shape {target.shape}.")
 
     waveform_loss = F.mse_loss(prediction, target)
@@ -722,7 +604,6 @@ def graph_training_loss(prediction, target, graph_edges, active_weight, active_t
     residual_map = predicted_map - target_map
     edge_smoothness = (residual_map[:, graph_edges[0]] - residual_map[:, graph_edges[1]]).square().mean()
 
-    # Symmetric Geodesic Loss
     probability = predicted_map / predicted_map.sum(dim=1, keepdim=True).clamp_min(1e-8)
     target_probability = target_map / target_map.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
@@ -732,67 +613,53 @@ def graph_training_loss(prediction, target, graph_edges, active_weight, active_t
         true_support = torch.where(active_target[i])[0]
         if len(true_support) == 0: true_support = target_map[i].argmax().reshape(1)
 
-        pred_support = torch.where(predicted_map[i] >= active_threshold_ratio * predicted_map[i].max().clamp_min(1e-8))[0]
-        if len(pred_support) == 0: pred_support = predicted_map[i].argmax().reshape(1)
-
+        # Differentiable softmin for target-to-prediction support
         d_p2t = GEODESIC_TENSOR[:, true_support].amin(dim=1)
-        d_t2p = GEODESIC_TENSOR[:, pred_support].amin(dim=1)
+        tau = 10.0
+        softmin_d = -tau * torch.logsumexp(-GEODESIC_TENSOR / tau + torch.log(probability[i] + 1e-12).unsqueeze(0), dim=1)
 
         geodesic_terms_p2t.append((probability[i] * d_p2t).sum() / 100.0)
-        geodesic_terms_t2p.append((target_probability[i] * d_t2p).sum() / 100.0)
+        geodesic_terms_t2p.append((target_probability[i] * softmin_d).sum() / 100.0)
 
     geodesic_loss = (torch.stack(geodesic_terms_p2t).mean() + torch.stack(geodesic_terms_t2p).mean()) / 2.0
 
-    # Forward Consistency
     reconstructed_eeg = torch.einsum("cv,bvt->bct", LEAD_FIELD_TENSOR, prediction)
-    target_eeg = torch.einsum("cv,bvt->bct", LEAD_FIELD_TENSOR, target)
-    forward_loss = F.mse_loss(reconstructed_eeg, target_eeg)
+    prediction_physical = prediction * Y_TARGET_SCALE
+    reconstructed_eeg = torch.einsum("cv,bvt->bct", LEAD_FIELD_TENSOR, prediction_physical)
+    eeg_physical = eeg_target * X_INPUT_SCALE
+
+    forward_loss = ((reconstructed_eeg - eeg_physical).square().mean() / eeg_physical.square().mean().clamp_min(1e-12))
 
     total = waveform_loss + map_loss + spatial_weight * edge_smoothness + 2e-3 * geodesic_loss + forward_weight * forward_loss
     return total, waveform_loss.detach(), map_loss.detach()
 
 # ============================================================
-# 16. SMOKE TEST VALIDATION
+# 12. DATA LOADERS (USING PYTORCH GEOMETRIC BATCHING)
 # ============================================================
-tikhonov_cnn_model = TikhonovTemporalCNN().to(device)
-sparse_st_model = SparseSpatioTemporalGraphNet(hidden_dimension=32, dropout=0.20).to(device)
-physics_gat_model = FullPhysicsGAT().to(device)
+class PhysicsDataset(Dataset):
+    def __init__(self, x_data, y_data, build_dynamic_graph=False):
+        self.x = x_data
+        self.y = y_data
+        self.build_dynamic_graph = build_dynamic_graph
 
-print("\n" + "=" * 75)
-print("EXECUTING SMOKE TEST")
-print("=" * 75)
+    def __len__(self): return len(self.x)
 
-test_batch = next(iter(train_loader_graph))
-test_x, test_y = test_batch.x.reshape(-1, num_vertices, N_TIMES).to(device), test_batch.y.reshape(-1, num_vertices, N_TIMES).to(device)
-test_batch = test_batch.to(device)
+    def __getitem__(self, idx):
+        source_ts = self.x[idx]
+        target = self.y[idx]
 
-assert_finite_array("Smoke test batch_x", test_x)
-assert_finite_array("Smoke test batch_y", test_y)
+        if self.build_dynamic_graph:
+            edge_index, edge_attr = DYNAMIC_GRAPH_BUILDER(source_ts)
+        else:
+            edge_index, edge_attr = None, None
 
-with torch.no_grad():
-    # Test Physics GAT (PyG Batched)
-    pred_physics = physics_gat_model(test_batch)
-    assert_finite_array("Smoke test PhysicsGAT prediction", pred_physics)
+        return Data(
+            x=torch.from_numpy(source_ts),
+            y=torch.from_numpy(target),
+            edge_index=edge_index,
+            edge_attr=edge_attr
+        )
 
-    # Test Sparse ST
-    pred_sparse = sparse_st_model(test_x, sparse_adjacency)
-    assert_finite_array("Smoke test SparseST prediction", pred_sparse)
-
-    # Test CNN
-    pred_cnn = tikhonov_cnn_model(test_x)
-    assert_finite_array("Smoke test CNN prediction", pred_cnn)
-
-# Test Backward
-physics_gat_model.train()
-pred_physics = physics_gat_model(test_batch)
-test_loss, _, _ = graph_training_loss(pred_physics, test_y, edge_index_tensor, ACTIVE_WEIGHT, ACTIVE_THRESHOLD_RATIO, SPATIAL_LOSS_WEIGHT)
-assert_finite_array("Smoke test loss", test_loss)
-test_loss.backward()
-print("Forward and backward smoke test passed.\n")
-
-# ============================================================
-# 17. TRAIN NEURAL MODELS
-# ============================================================
 def execute_epoch(model_name, model, loader, optimizer, training):
     if training: model.train()
     else: model.eval()
@@ -802,21 +669,22 @@ def execute_epoch(model_name, model, loader, optimizer, training):
 
     with context:
         for batch in loader:
+            batch_size = batch.num_graphs
+
             if model_name == "full_physics_gat":
                 batch = batch.to(device)
-                batch_x = batch.x.reshape(-1, num_vertices, N_TIMES)
-                batch_y = batch.y.reshape(-1, num_vertices, N_TIMES)
+                batch_x = batch.x.reshape(batch_size, num_vertices, N_TIMES)
+                batch_y = batch.y.reshape(batch_size, num_vertices, N_TIMES)
+                prediction = model(batch)
             else:
-                batch_x = batch.x.to(device, non_blocking=True)
-                batch_y = batch.y.to(device, non_blocking=True)
+                batch_x = batch.x.reshape(batch_size, num_vertices, N_TIMES).to(device, non_blocking=True)
+                batch_y = batch.y.reshape(batch_size, num_vertices, N_TIMES).to(device, non_blocking=True)
+                if model_name == "sparse_st_graph": prediction = model(batch_x, sparse_adjacency)
+                elif model_name == "tikhonov_cnn": prediction = model(batch_x)
 
             if training: optimizer.zero_grad(set_to_none=True)
 
-            if model_name == "sparse_st_graph": prediction = model(batch_x, sparse_adjacency)
-            elif model_name == "tikhonov_cnn": prediction = model(batch_x)
-            else: prediction = model(batch)
-
-            loss, wave_l, map_l = graph_training_loss(prediction, batch_y, edge_index_tensor, ACTIVE_WEIGHT, ACTIVE_THRESHOLD_RATIO, SPATIAL_LOSS_WEIGHT)
+            loss, wave_l, map_l = graph_training_loss(prediction, batch_y, batch_x, edge_index_tensor, ACTIVE_WEIGHT, ACTIVE_THRESHOLD_RATIO, SPATIAL_LOSS_WEIGHT)
 
             if training:
                 loss.backward()
@@ -831,324 +699,384 @@ def execute_epoch(model_name, model, loader, optimizer, training):
 
     return {"loss": total_loss / total_samples, "wave": total_wave / total_samples, "map": total_map / total_samples}
 
-def train_model_loop(model_name, model, loader_train, loader_val, save_path):
-    print(f"\n{'='*75}\nTRAINING: {model_name.upper()}\n{'='*75}")
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=SCHEDULER_PATIENCE, min_lr=1e-6)
+# ============================================================
+# 13. SEED LOOP
+# ============================================================
+all_synthetic_results = []
+all_real_results = []
+all_timing_results = []
 
-    history = []
-    best_validation_loss = float("inf")
-    epochs_without_improvement = 0
-    start_epoch = 1
-    start_time = time.time()
+for seed_idx, current_seed in enumerate(SEEDS):
+    print(f"\n{'='*75}\nSTARTING PIPELINE FOR SEED {current_seed}\n{'='*75}")
+    set_global_seed(current_seed)
 
-    last_save_path = save_path.replace("best", "last")
+    def make_simulation(n_samples, seed_val, snr, extents, sources=3):
+        set_global_seed(seed_val)
+        settings = {"duration_of_trial": SIMULATION_DURATION, "number_of_sources": sources, "extents": extents, "target_snr": snr}
+        simulation = Simulation(fwd_fixed, epochs.info.copy(), settings=settings)
+        simulation.simulate(n_samples=n_samples)
+        return simulation
 
-    # Resume Checkpointing Logic
-    if os.path.exists(last_save_path):
-        chkpt = torch.load(last_save_path, map_location=device, weights_only=False)
-        model.load_state_dict(chkpt["model_state_dict"])
-        optimizer.load_state_dict(chkpt["optimizer_state_dict"])
-        scheduler.load_state_dict(chkpt["scheduler_state_dict"])
-        start_epoch = chkpt["epoch"] + 1
-        best_validation_loss = chkpt["best_validation_loss"]
-        epochs_without_improvement = chkpt["epochs_without_improvement"]
-        history = chkpt.get("history", [])
-        print(f"Resumed from epoch {start_epoch - 1}")
+    sim_train = make_simulation(N_TRAIN, current_seed, TARGET_SNR, SOURCE_EXTENTS, sources=NUM_SIMULATED_SOURCES)
+    sim_validation = make_simulation(N_VALIDATION, current_seed + 1, TARGET_SNR, SOURCE_EXTENTS, sources=NUM_SIMULATED_SOURCES)
 
-    for epoch in range(start_epoch, MAX_EPOCHS + 1):
-        train_stats = execute_epoch(model_name, model, loader_train, optimizer, training=True)
-        val_stats = execute_epoch(model_name, model, loader_val, optimizer, training=False)
+    sim_test_id = make_simulation(N_TEST, current_seed + 100, TARGET_SNR, SOURCE_EXTENTS, sources=NUM_SIMULATED_SOURCES)
+    sim_test_ood_snr = make_simulation(N_TEST, current_seed + 101, OOD_SNR, SOURCE_EXTENTS, sources=NUM_SIMULATED_SOURCES)
+    sim_test_ood_extent = make_simulation(N_TEST, current_seed + 102, TARGET_SNR, OOD_EXTENTS, sources=NUM_SIMULATED_SOURCES)
+    sim_test_ood_sources = make_simulation(N_TEST, current_seed + 103, TARGET_SNR, SOURCE_EXTENTS, sources=OOD_NUM_SIMULATED_SOURCES)
 
-        validation_loss = val_stats["loss"]
-        scheduler.step(validation_loss)
-        learning_rate = optimizer.param_groups[0]["lr"]
+    X_eeg_train = extract_eeg_collection(sim_train.eeg_data)
+    Y_source_train = extract_source_full(sim_train.source_data)
+    if X_eeg_train.shape[-1] != N_TIMES: raise RuntimeError(f"Unexpected EEG time dimension: expected {N_TIMES}, received {X_eeg_train.shape[-1]}")
+    if Y_source_train.shape[-1] != N_TIMES: raise RuntimeError(f"Unexpected Source time dimension: expected {N_TIMES}, received {Y_source_train.shape[-1]}")
 
-        history.append({
-            "Epoch": epoch, "Training loss": train_stats["loss"], "Validation loss": val_stats["loss"],
-            "Training wave": train_stats["wave"], "Validation wave": val_stats["wave"],
-            "Training map": train_stats["map"], "Validation map": val_stats["map"], "Learning rate": learning_rate
+    X_eeg_validation = extract_eeg_collection(sim_validation.eeg_data)
+    Y_source_validation = extract_source_full(sim_validation.source_data)
+
+    X_eeg_test_id, Y_source_test_id = extract_test(sim_test_id)
+    X_eeg_test_ood_snr, Y_source_test_ood_snr = extract_test(sim_test_ood_snr)
+    X_eeg_test_ood_extent, Y_source_test_ood_extent = extract_test(sim_test_ood_extent)
+    X_eeg_test_ood_sources, Y_source_test_ood_sources = extract_test(sim_test_ood_sources)
+
+    def compute_tikhonov_inverse(forward_matrix, relative_regularization):
+        K = np.asarray(forward_matrix, dtype=np.float64)
+        sensor_gram = K @ K.T
+        average_eigenvalue = np.trace(sensor_gram) / sensor_gram.shape[0]
+        regularization = relative_regularization * average_eigenvalue
+        regularized_gram = sensor_gram + regularization * np.eye(sensor_gram.shape[0])
+        inverse_operator = K.T @ np.linalg.solve(regularized_gram, np.eye(regularized_gram.shape[0]))
+        return inverse_operator.astype(np.float32), float(regularization)
+
+    K_dagger, effective_regularization = compute_tikhonov_inverse(lead_field, TIKHONOV_RELATIVE_REGULARIZATION)
+
+    def apply_tikhonov_batch(eeg_batch, inverse_operator):
+        return np.einsum("vc,bct->bvt", inverse_operator, eeg_batch, optimize=True).astype(np.float32)
+
+    X_source_train = apply_tikhonov_batch(X_eeg_train, K_dagger)
+    X_source_validation = apply_tikhonov_batch(X_eeg_validation, K_dagger)
+    X_source_test_id = apply_tikhonov_batch(X_eeg_test_id, K_dagger)
+    X_source_test_ood_snr = apply_tikhonov_batch(X_eeg_test_ood_snr, K_dagger)
+    X_source_test_ood_extent = apply_tikhonov_batch(X_eeg_test_ood_extent, K_dagger)
+    X_source_test_ood_sources = apply_tikhonov_batch(X_eeg_test_ood_sources, K_dagger)
+
+    def robust_scale(array, percentile=99.5):
+        value = np.percentile(np.abs(array), percentile)
+        return float(max(value, 1e-12))
+
+    X_INPUT_SCALE = robust_scale(X_source_train)
+    Y_TARGET_SCALE = robust_scale(Y_source_train)
+
+    def normalize_input(array): return np.clip(array / X_INPUT_SCALE, -10.0, 10.0).astype(np.float32)
+    def normalize_target(array): return np.clip(array / Y_TARGET_SCALE, -10.0, 10.0).astype(np.float32)
+
+    X_source_train = normalize_input(X_source_train)
+    X_source_validation = normalize_input(X_source_validation)
+    X_source_test_id = normalize_input(X_source_test_id)
+    X_source_test_ood_snr = normalize_input(X_source_test_ood_snr)
+    X_source_test_ood_extent = normalize_input(X_source_test_ood_extent)
+    X_source_test_ood_sources = normalize_input(X_source_test_ood_sources)
+
+    Y_source_train = normalize_target(Y_source_train)
+    Y_source_validation = normalize_target(Y_source_validation)
+    Y_source_test_id = normalize_target(Y_source_test_id)
+    Y_source_test_ood_snr = normalize_target(Y_source_test_ood_snr)
+    Y_source_test_ood_extent = normalize_target(Y_source_test_ood_extent)
+    Y_source_test_ood_sources = normalize_target(Y_source_test_ood_sources)
+
+    train_loader_graph = PyGDataLoader(PhysicsDataset(X_source_train, Y_source_train, build_dynamic_graph=True), batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader_graph = PyGDataLoader(PhysicsDataset(X_source_validation, Y_source_validation, build_dynamic_graph=True), batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+    train_loader_cnn = PyGDataLoader(PhysicsDataset(X_source_train, Y_source_train, build_dynamic_graph=False), batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader_cnn = PyGDataLoader(PhysicsDataset(X_source_validation, Y_source_validation, build_dynamic_graph=False), batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+    # Clean memory of large arrays before training begins
+    del X_eeg_train, Y_source_train, X_eeg_validation, Y_source_validation
+    gc.collect()
+
+    tikhonov_cnn_model = TikhonovTemporalCNN().to(device)
+    sparse_st_model = SparseSpatioTemporalGraphNet(hidden_dimension=32, dropout=0.20).to(device)
+    physics_gat_model = FullPhysicsGAT().to(device)
+
+    # SMOKE TEST
+    if seed_idx == 0:
+        print("\n" + "=" * 75)
+        print("EXECUTING SMOKE TEST")
+        print("=" * 75)
+        test_batch = next(iter(train_loader_graph))
+        test_x = test_batch.x.reshape(test_batch.num_graphs, num_vertices, N_TIMES).to(device)
+        test_y = test_batch.y.reshape(test_batch.num_graphs, num_vertices, N_TIMES).to(device)
+        test_batch = test_batch.to(device)
+
+        assert_finite_array("Smoke test batch_x", test_x)
+        assert_finite_array("Smoke test batch_y", test_y)
+
+        with torch.no_grad():
+            pred_physics = physics_gat_model(test_batch)
+            assert_finite_array("Smoke test PhysicsGAT prediction", pred_physics)
+            pred_sparse = sparse_st_model(test_x, sparse_adjacency)
+            assert_finite_array("Smoke test SparseST prediction", pred_sparse)
+            pred_cnn = tikhonov_cnn_model(test_x)
+            assert_finite_array("Smoke test CNN prediction", pred_cnn)
+
+        physics_gat_model.train()
+        pred_physics = physics_gat_model(test_batch)
+        test_loss, _, _ = graph_training_loss(pred_physics, test_y, test_x, edge_index_tensor, ACTIVE_WEIGHT, ACTIVE_THRESHOLD_RATIO, SPATIAL_LOSS_WEIGHT)
+        assert_finite_array("Smoke test loss", test_loss)
+        test_loss.backward()
+        print("Forward and backward smoke test passed.\n")
+
+    def train_model_loop(model_name, model, loader_train, loader_val, save_path):
+        print(f"\n{'='*75}\nTRAINING: {model_name.upper()}\n{'='*75}")
+        optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=SCHEDULER_PATIENCE, min_lr=1e-6)
+
+        history = []
+        best_validation_loss = float("inf")
+        epochs_without_improvement = 0
+        start_epoch = 1
+        start_time = time.time()
+
+        last_save_path = save_path.replace("best", "last")
+        if os.path.exists(last_save_path):
+            chkpt = torch.load(last_save_path, map_location=device, weights_only=False)
+            model.load_state_dict(chkpt["model_state_dict"])
+            optimizer.load_state_dict(chkpt["optimizer_state_dict"])
+            scheduler.load_state_dict(chkpt["scheduler_state_dict"])
+            start_epoch = chkpt["epoch"] + 1
+            best_validation_loss = chkpt["best_validation_loss"]
+            epochs_without_improvement = chkpt["epochs_without_improvement"]
+            history = chkpt.get("history", [])
+            random.setstate(chkpt["python_rng"])
+            np.random.set_state(chkpt["numpy_rng"])
+            torch.set_rng_state(chkpt["torch_rng"])
+            if torch.cuda.is_available() and chkpt["cuda_rng"] is not None: torch.cuda.set_rng_state_all(chkpt["cuda_rng"])
+            print(f"Resumed from epoch {start_epoch - 1}")
+
+        for epoch in range(start_epoch, MAX_EPOCHS + 1):
+            train_stats = execute_epoch(model_name, model, loader_train, optimizer, training=True)
+            val_stats = execute_epoch(model_name, model, loader_val, optimizer, training=False)
+
+            validation_loss = val_stats["loss"]
+            scheduler.step(validation_loss)
+            learning_rate = optimizer.param_groups[0]["lr"]
+
+            history.append({
+                "Epoch": epoch, "Training loss": train_stats["loss"], "Validation loss": val_stats["loss"],
+                "Training wave": train_stats["wave"], "Validation wave": val_stats["wave"],
+                "Training map": train_stats["map"], "Validation map": val_stats["map"], "Learning rate": learning_rate
+            })
+
+            improved = validation_loss < best_validation_loss - 1e-7
+            if improved:
+                best_validation_loss = validation_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+
+            checkpoint_data = {
+                "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(), "epoch": epoch,
+                "best_validation_loss": best_validation_loss, "epochs_without_improvement": epochs_without_improvement,
+                "input_scale": X_INPUT_SCALE, "target_scale": Y_TARGET_SCALE,
+                "channel_names": epochs.ch_names, "vertices": [fwd_fixed["src"][0]["vertno"], fwd_fixed["src"][1]["vertno"]],
+                "history": history, "python_rng": random.getstate(), "numpy_rng": np.random.get_state(),
+                "torch_rng": torch.get_rng_state(), "cuda_rng": (torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None),
+            }
+
+            torch.save(checkpoint_data, last_save_path)
+            if improved: torch.save(checkpoint_data, save_path)
+
+            if epoch == 1 or epoch % 10 == 0 or improved:
+                print(f"Epoch {epoch:03d} | Train={train_stats['loss']:.6f} | Val={validation_loss:.6f} | LR={learning_rate:.2e}")
+
+            if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+                print("Early stopping at epoch", epoch)
+                break
+
+        training_minutes = (time.time() - start_time) / 60.0
+        print(f"{model_name} training time: {training_minutes:.2f} minutes")
+
+        if os.path.exists(save_path):
+            checkpoint = torch.load(save_path, map_location=device, weights_only=False)
+            model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
+        return history, training_minutes
+
+    cnn_path_seed = TIKHONOV_CNN_PATH.replace(".pt", f"_{current_seed}.pt")
+    graph_path_seed = GRAPH_MODEL_PATH.replace(".pt", f"_{current_seed}.pt")
+    physics_path_seed = PHYSICS_GAT_PATH.replace(".pt", f"_{current_seed}.pt")
+    convdip_path_seed = f"{CONVDIP_MODEL_PATH}_{current_seed}"
+
+    cnn_history, cnn_train_mins = train_model_loop("tikhonov_cnn", tikhonov_cnn_model, train_loader_cnn, val_loader_cnn, cnn_path_seed)
+    sparse_history, sparse_train_mins = train_model_loop("sparse_st_graph", sparse_st_model, train_loader_cnn, val_loader_cnn, graph_path_seed)
+    physics_history, physics_train_mins = train_model_loop("full_physics_gat", physics_gat_model, train_loader_graph, val_loader_graph, physics_path_seed)
+
+    print("\n" + "=" * 75)
+    print("TRAINING: CONVDIP")
+    print("=" * 75)
+    set_global_seed(current_seed)
+    convdip_model = Net(fwd_fixed)
+    convdip_training_start = time.time()
+    convdip_model.fit(sim_train, epochs=MAX_EPOCHS, batch_size=BATCH_SIZE)
+    convdip_training_minutes = (time.time() - convdip_training_start) / 60.0
+    try: convdip_model.save(convdip_path_seed)
+    except Exception: pass
+
+    # ============================================================
+    # SYNTHETIC EVALUATION
+    # ============================================================
+    def maximum_absolute_map(stc_data): return np.max(np.abs(stc_data), axis=-1)
+    def normalize_map(source_map):
+        source_map = np.asarray(source_map, dtype=np.float64)
+        return source_map / (np.max(np.abs(source_map)) + 1e-12)
+    def normalized_map_mse(first_map, second_map): return float(np.mean((normalize_map(first_map) - normalize_map(second_map)) ** 2))
+    def cosine_similarity(first_map, second_map): return float(1.0 - cosine(normalize_map(first_map), normalize_map(second_map)))
+    def peak_index(stc_map): return int(np.argmax(stc_map))
+
+    def evaluate_synthetic(model_name, model, x_data, y_true, condition_name):
+        model.eval()
+        with torch.no_grad():
+            if model_name == "convdip":
+                temp_sim = Simulation(fwd_fixed, epochs.info.copy())
+                temp_sim.eeg_data = [mne.EvokedArray(x_data[i], epochs.info, tmin=0.0) for i in range(len(x_data))]
+                try:
+                    preds_list = convdip_model.predict(temp_sim)
+                    pred = np.stack([p.data for p in preds_list], axis=0)
+                except Exception as e:
+                    raise RuntimeError("ConvDip prediction failed during synthetic evaluation.") from e
+            else:
+                x_tensor = torch.from_numpy(x_data).to(device)
+                if model_name == "tikhonov_cnn": pred = model(x_tensor)
+                elif model_name == "sparse_st_graph": pred = model(x_tensor, sparse_adjacency)
+                elif model_name == "full_physics_gat":
+                    ds = PhysicsDataset(x_data, y_true, build_dynamic_graph=True)
+                    dl = PyGDataLoader(ds, batch_size=BATCH_SIZE, shuffle=False)
+                    preds = []
+                    for b in dl:
+                        b = b.to(device)
+                        preds.append(model(b))
+                    pred = torch.cat(preds, dim=0)
+                pred = pred.cpu().numpy()
+
+        if model_name == "convdip":
+            # ConvDip predicts in physical scale, so compare against unscaled physical y_true
+            mse = np.mean((pred - (y_true * Y_TARGET_SCALE))**2)
+        else:
+            mse = np.mean((pred - y_true)**2)
+        target_map = np.max(np.abs(y_true), axis=-1)
+        pred_map = np.max(np.abs(pred), axis=-1)
+
+        spearman_r, _ = spearmanr(normalize_map(target_map.mean(axis=0)), normalize_map(pred_map.mean(axis=0)))
+        peak_dist = GEODESIC_MM[peak_index(target_map.mean(axis=0)), peak_index(pred_map.mean(axis=0))]
+
+        all_synthetic_results.append({
+            "Seed": current_seed, "Condition": condition_name, "Algorithm": model_name,
+            "Waveform MSE": float(mse),
+            "Normalized-map MSE": normalized_map_mse(target_map.mean(axis=0), pred_map.mean(axis=0)),
+            "Cosine Similarity": cosine_similarity(target_map.mean(axis=0), pred_map.mean(axis=0)),
+            "Peak distance (mm)": float(peak_dist)
         })
 
-        improved = validation_loss < best_validation_loss - 1e-7
-        checkpoint_data = {
-            "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(), "epoch": epoch,
-            "best_validation_loss": best_validation_loss, "epochs_without_improvement": epochs_without_improvement,
-            "input_scale": X_INPUT_SCALE, "target_scale": Y_TARGET_SCALE,
-            "channel_names": epochs.ch_names, "vertices": [fwd_fixed["src"][0]["vertno"], fwd_fixed["src"][1]["vertno"]],
-            "history": history
-        }
-
-        torch.save(checkpoint_data, last_save_path)
-
-        if improved:
-            best_validation_loss = validation_loss
-            epochs_without_improvement = 0
-            torch.save(checkpoint_data, save_path)
-        else:
-            epochs_without_improvement += 1
-
-        if epoch == 1 or epoch % 10 == 0 or improved:
-            print(f"Epoch {epoch:03d} | Train={train_stats['loss']:.6f} | Val={validation_loss:.6f} | LR={learning_rate:.2e}")
-
-        if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
-            print("Early stopping at epoch", epoch)
-            break
-
-    training_minutes = (time.time() - start_time) / 60.0
-    print(f"{model_name} training time: {training_minutes:.2f} minutes")
-
-    if os.path.exists(save_path):
-        checkpoint = torch.load(save_path, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-    return history, training_minutes
-
-cnn_history, cnn_train_mins = train_model_loop("tikhonov_cnn", tikhonov_cnn_model, train_loader_cnn, val_loader_cnn, TIKHONOV_CNN_PATH)
-sparse_history, sparse_train_mins = train_model_loop("sparse_st_graph", sparse_st_model, train_loader_cnn, val_loader_cnn, GRAPH_MODEL_PATH)
-physics_history, physics_train_mins = train_model_loop("full_physics_gat", physics_gat_model, train_loader_graph, val_loader_graph, PHYSICS_GAT_PATH)
-
-pd.DataFrame(sparse_history).to_csv(TRAINING_HISTORY_PATH, index=False)
-pd.DataFrame(physics_history).to_csv(os.path.join(OUTPUT_DIR, "physics_gat_history.csv"), index=False)
-pd.DataFrame(cnn_history).to_csv(os.path.join(OUTPUT_DIR, "tikhonov_cnn_history.csv"), index=False)
-
-# ============================================================
-# 18. TRAIN CONVDIP
-# ============================================================
-print("\n" + "=" * 75)
-print("TRAINING: CONVDIP")
-print("=" * 75)
-
-set_global_seed(SEEDS[0])
-convdip_model = Net(fwd_fixed)
-convdip_training_start = time.time()
-convdip_model.fit(sim_train, epochs=MAX_EPOCHS, batch_size=BATCH_SIZE)
-convdip_training_minutes = (time.time() - convdip_training_start) / 60.0
-
-try:
-    convdip_model.save(CONVDIP_MODEL_PATH)
-except Exception:
-    pass
-
-# ============================================================
-# 19. SYNTHETIC EVALUATION METRICS
-# ============================================================
-def synthetic_eval(model_name, model, x_data, y_true):
-    model.eval()
-    with torch.no_grad():
-        x_tensor = torch.from_numpy(x_data).to(device)
-        if model_name == "tikhonov_cnn": pred = model(x_tensor)
-        elif model_name == "sparse_st_graph": pred = model(x_tensor, sparse_adjacency)
-        elif model_name == "full_physics_gat":
-            # For test evaluation, loop through or build one big PyG batch
-            ds = PhysicsDataset(x_data, y_true, build_dynamic_graph=True)
-            dl = PyGDataLoader(ds, batch_size=BATCH_SIZE, shuffle=False)
-            preds = []
-            for b in dl:
-                preds.append(model(b.to(device)))
-            pred = torch.cat(preds, dim=0)
-        else: # ConvDip
-            # Evaluate ConvDip natively on synthetic test sets
-            import mne
-            from esinet import Simulation
-
-            # Reconstruct temporary Simulation obj to pass to ConvDip for fair processing
-            temp_sim = Simulation(fwd_fixed, epochs.info.copy())
-            temp_sim.eeg_data = [mne.EvokedArray(x_data[i], epochs.info, tmin=0.0) for i in range(len(x_data))]
-            temp_sim.source_data = [mne.SourceEstimate(y_true[i], vertices=[fwd_fixed["src"][0]["vertno"], fwd_fixed["src"][1]["vertno"]], tmin=0.0, tstep=1.0) for i in range(len(y_true))]
-
-            try:
-                preds_list = convdip_model.predict(temp_sim)
-                pred_arrays = [p.data for p in preds_list]
-                pred = torch.from_numpy(np.stack(pred_arrays, axis=0))
-            except Exception:
-                pred = torch.zeros_like(torch.from_numpy(y_true))
-
-    pred_np = pred.cpu().numpy()
-
-    target_map = np.max(np.abs(y_true), axis=-1)
-    pred_map = np.max(np.abs(pred_np), axis=-1)
-
-    mse = np.mean((pred_np - y_true)**2)
-    return mse
-
-print("\nSynthetic Test ID MSE:")
-print(f"CNN: {synthetic_eval('tikhonov_cnn', tikhonov_cnn_model, X_source_test_id, Y_source_test_id):.6f}")
-print(f"SparseST: {synthetic_eval('sparse_st_graph', sparse_st_model, X_source_test_id, Y_source_test_id):.6f}")
-print(f"PhysicsGAT: {synthetic_eval('full_physics_gat', physics_gat_model, X_source_test_id, Y_source_test_id):.6f}")
-
-print("\nSynthetic Test OOD-SNR MSE:")
-print(f"CNN: {synthetic_eval('tikhonov_cnn', tikhonov_cnn_model, X_source_test_ood_snr, Y_source_test_ood_snr):.6f}")
-print(f"SparseST: {synthetic_eval('sparse_st_graph', sparse_st_model, X_source_test_ood_snr, Y_source_test_ood_snr):.6f}")
-print(f"PhysicsGAT: {synthetic_eval('full_physics_gat', physics_gat_model, X_source_test_ood_snr, Y_source_test_ood_snr):.6f}")
-
-del sim_train
-gc.collect()
-
-# ============================================================
-# 20. dSPM CLASSICAL INVERSE ON REAL EEG
-# ============================================================
-print("\n" + "=" * 75)
-print("PHASE 6: COMPUTING REAL EEG dSPM REFERENCE")
-print("=" * 75)
-
-noise_covariance = mne.compute_covariance(epochs, tmin=EPOCH_TMIN, tmax=0.0, method=["shrunk", "empirical"], rank=None, verbose=False)
-dspm_inverse_operator = mne.minimum_norm.make_inverse_operator(info=epochs.info, forward=fwd_free, noise_cov=noise_covariance, loose=0.2, depth=0.8, fixed=False, rank=None, verbose=False)
-lambda2 = 1.0 / TARGET_SNR ** 2
-
-dspm_results = {}
-for condition_name, evoked in evoked_conditions.items():
-    dspm_results[condition_name] = mne.minimum_norm.apply_inverse(evoked, dspm_inverse_operator, lambda2=lambda2, method="dSPM", pick_ori=None, verbose=False)
-
-# ============================================================
-# 21. INFERENCE UTILITIES
-# ============================================================
-def create_graph_stc(source_map):
-    return mne.SourceEstimate(data=source_map[:, np.newaxis], vertices=[fwd_fixed["src"][0]["vertno"], fwd_fixed["src"][1]["vertno"]], tmin=0.0, tstep=1.0, subject="sample")
-
-@torch.no_grad()
-def predict_graph_on_real_evoked(evoked, model_name, model):
-    eeg_data = np.asarray(evoked.data, dtype=np.float32)
-    source_initialization = np.einsum("vc,ct->vt", K_dagger, eeg_data, optimize=True).astype(np.float32)
-    source_initialization = np.clip(source_initialization / X_INPUT_SCALE, -10.0, 10.0)
-    model_input = torch.from_numpy(source_initialization).unsqueeze(0).to(device)
-
-    if torch.cuda.is_available(): torch.cuda.synchronize()
-    start = time.perf_counter()
-
-    if model_name == "sparse_st_graph": prediction_scaled = model(model_input, sparse_adjacency)
-    elif model_name == "tikhonov_cnn": prediction_scaled = model(model_input)
-    else:
-        edge_index, edge_attr = DYNAMIC_GRAPH_BUILDER(source_initialization)
-        ds = Data(x=model_input[0], edge_index=edge_index, edge_attr=edge_attr)
-        dl = PyGDataLoader([ds], batch_size=1)
-        b = next(iter(dl)).to(device)
-        prediction_scaled = model(b)
-
-    if torch.cuda.is_available(): torch.cuda.synchronize()
-    elapsed_ms = (time.perf_counter() - start) * 1000.0
-
-    source_map = prediction_scaled.abs().amax(dim=-1).squeeze(0).cpu().numpy() * Y_TARGET_SCALE
-    source_map = np.maximum(source_map, 0.0)
-
-    return create_graph_stc(source_map), elapsed_ms
-
-def normalize_convdip_prediction(prediction):
-    if isinstance(prediction, (list, tuple)): return prediction[0]
-    if hasattr(prediction, "data"): return prediction
-    return prediction[0]
-
-def predict_convdip_on_real_evoked(evoked):
-    start = time.perf_counter()
-    try: prediction = convdip_model.predict(evoked)
-    except Exception: prediction = convdip_model.predict([evoked])
-    elapsed_ms = (time.perf_counter() - start) * 1000.0
-
-    stc = normalize_convdip_prediction(prediction)
-    source_map = np.max(np.abs(stc.data), axis=1)
-    return create_graph_stc(source_map), elapsed_ms
-
-# ============================================================
-# 22. RUN ALL NEURAL INVERSE METHODS ON REAL EEG
-# ============================================================
-print("\n" + "=" * 75)
-print("PHASE 7: NEURAL INVERSE ON REAL EEG")
-print("=" * 75)
-
-cnn_results, sparse_results, physics_results, convdip_results = {}, {}, {}, {}
-timing_rows = []
-
-# Warmups
-first_evoked = next(iter(evoked_conditions.values()))
-_ = predict_graph_on_real_evoked(first_evoked, "tikhonov_cnn", tikhonov_cnn_model)
-_ = predict_graph_on_real_evoked(first_evoked, "sparse_st_graph", sparse_st_model)
-_ = predict_graph_on_real_evoked(first_evoked, "full_physics_gat", physics_gat_model)
-try: _ = predict_convdip_on_real_evoked(first_evoked)
-except Exception: pass
-
-for condition_name, evoked in evoked_conditions.items():
-    cnn_stc, cnn_time = predict_graph_on_real_evoked(evoked, "tikhonov_cnn", tikhonov_cnn_model)
-    sparse_stc, sparse_time = predict_graph_on_real_evoked(evoked, "sparse_st_graph", sparse_st_model)
-    physics_stc, physics_time = predict_graph_on_real_evoked(evoked, "full_physics_gat", physics_gat_model)
-    convdip_stc, convdip_time = predict_convdip_on_real_evoked(evoked)
-
-    cnn_results[condition_name] = cnn_stc
-    sparse_results[condition_name] = sparse_stc
-    physics_results[condition_name] = physics_stc
-    convdip_results[condition_name] = convdip_stc
-
-    timing_rows.extend([
-        {"Condition": condition_name, "Algorithm": "Tikhonov-CNN", "Inference time (ms)": cnn_time},
-        {"Condition": condition_name, "Algorithm": "Sparse ST-Graph", "Inference time (ms)": sparse_time},
-        {"Condition": condition_name, "Algorithm": "FullPhysicsGAT", "Inference time (ms)": physics_time},
-        {"Condition": condition_name, "Algorithm": "ConvDip", "Inference time (ms)": convdip_time}
-    ])
-
-timing_df = pd.DataFrame(timing_rows)
-timing_df.to_csv(REAL_TIMING_PATH, index=False)
-
-# ============================================================
-# 23. REAL-DATA AGREEMENT METRICS
-# ============================================================
-def maximum_absolute_map(stc): return np.max(np.abs(stc.data), axis=1)
-
-def normalize_map(source_map):
-    source_map = np.asarray(source_map, dtype=np.float64)
-    return source_map / (np.max(np.abs(source_map)) + 1e-12)
-
-def normalized_map_mse(first_map, second_map): return float(np.mean((normalize_map(first_map) - normalize_map(second_map)) ** 2))
-
-def cosine_similarity(first_map, second_map): return float(1.0 - cosine(normalize_map(first_map), normalize_map(second_map)))
-
-def peak_index(stc): return int(np.argmax(maximum_absolute_map(stc)))
-
-def compute_agreement_metrics(reference_stc, predicted_stc):
-    reference_map = maximum_absolute_map(reference_stc)
-    predicted_map = maximum_absolute_map(predicted_stc)
-    spearman_r, _ = spearmanr(normalize_map(reference_map), normalize_map(predicted_map))
-    peak_distance = GEODESIC_MM[peak_index(reference_stc), peak_index(predicted_stc)]
-
-    return {
-        "Spearman correlation with dSPM": float(spearman_r),
-        "Cosine similarity with dSPM": cosine_similarity(reference_map, predicted_map),
-        "Normalized-map MSE vs dSPM": normalized_map_mse(reference_map, predicted_map),
-        "Peak distance from dSPM (mm)": float(peak_distance)
-    }
-
-real_result_rows = []
-for condition_name in evoked_conditions:
-    for algorithm_name, predicted_stc in [
-        ("Tikhonov-CNN", cnn_results[condition_name]),
-        ("Sparse ST-Graph", sparse_results[condition_name]),
-        ("FullPhysicsGAT", physics_results[condition_name]),
-        ("ConvDip", convdip_results[condition_name])
+    for condition, x_val, y_val in [
+        ("ID", X_source_test_id, Y_source_test_id),
+        ("OOD-SNR", X_source_test_ood_snr, Y_source_test_ood_snr),
+        ("OOD-Extent", X_source_test_ood_extent, Y_source_test_ood_extent),
+        ("OOD-Sources", X_source_test_ood_sources, Y_source_test_ood_sources)
     ]:
-        metrics = compute_agreement_metrics(reference_stc=dspm_results[condition_name], predicted_stc=predicted_stc)
-        metrics.update({"Condition": condition_name, "Algorithm": algorithm_name})
-        real_result_rows.append(metrics)
+        evaluate_synthetic("tikhonov_cnn", tikhonov_cnn_model, x_val, y_val, condition)
+        evaluate_synthetic("sparse_st_graph", sparse_st_model, x_val, y_val, condition)
+        evaluate_synthetic("full_physics_gat", physics_gat_model, x_val, y_val, condition)
+        evaluate_synthetic("convdip", convdip_model, X_eeg_test_id if condition=="ID" else (X_eeg_test_ood_snr if condition=="OOD-SNR" else (X_eeg_test_ood_extent if condition=="OOD-Extent" else X_eeg_test_ood_sources)), y_val, condition)
 
-real_results_df = pd.DataFrame(real_result_rows)
-real_results_df.to_csv(REAL_RESULTS_PATH, index=False)
-print("\nReal-data agreement with dSPM:")
-print(real_results_df.round(4))
+    del sim_test_id, sim_test_ood_snr, sim_test_ood_extent, sim_test_ood_sources, sim_train
+    gc.collect()
+
+    # ============================================================
+    # REAL EEG INFERENCE
+    # ============================================================
+    noise_covariance = mne.compute_covariance(epochs, tmin=EPOCH_TMIN, tmax=0.0, method=["shrunk", "empirical"], rank=None, verbose=False)
+    dspm_inverse_operator = mne.minimum_norm.make_inverse_operator(info=epochs.info, forward=fwd_free, noise_cov=noise_covariance, loose=0.2, depth=0.8, fixed=False, rank=None, verbose=False)
+    lambda2 = 1.0 / TARGET_SNR ** 2
+
+    dspm_results = {}
+    for condition_name, evoked in evoked_conditions.items():
+        dspm_results[condition_name] = mne.minimum_norm.apply_inverse(evoked, dspm_inverse_operator, lambda2=lambda2, method="dSPM", pick_ori=None, verbose=False)
+
+    def create_graph_stc(source_map): return mne.SourceEstimate(data=source_map[:, np.newaxis], vertices=[fwd_fixed["src"][0]["vertno"], fwd_fixed["src"][1]["vertno"]], tmin=0.0, tstep=1.0, subject="sample")
+
+    @torch.no_grad()
+    def predict_graph_on_real_evoked(evoked, model_name, model):
+        t0 = time.perf_counter()
+        eeg_data = np.asarray(evoked.data, dtype=np.float32)
+        source_initialization = np.einsum("vc,ct->vt", K_dagger, eeg_data, optimize=True).astype(np.float32)
+        source_initialization = np.clip(source_initialization / X_INPUT_SCALE, -10.0, 10.0)
+        model_input = torch.from_numpy(source_initialization).unsqueeze(0).to(device)
+
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        if model_name == "sparse_st_graph": prediction_scaled = model(model_input, sparse_adjacency)
+        elif model_name == "tikhonov_cnn": prediction_scaled = model(model_input)
+        else:
+            edge_index, edge_attr = DYNAMIC_GRAPH_BUILDER(source_initialization)
+            ds = Data(x=model_input[0], edge_index=edge_index, edge_attr=edge_attr)
+            dl = PyGDataLoader([ds], batch_size=1)
+            b = next(iter(dl)).to(device)
+            prediction_scaled = model(b)
+
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        source_map = prediction_scaled.abs().amax(dim=-1).squeeze(0).cpu().numpy() * Y_TARGET_SCALE
+        source_map = np.maximum(source_map, 0.0)
+        return create_graph_stc(source_map), elapsed_ms
+
+    def predict_convdip_on_real_evoked(evoked):
+        t0 = time.perf_counter()
+        try: prediction = convdip_model.predict(evoked)
+        except Exception: prediction = convdip_model.predict([evoked])
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        stc = prediction[0] if isinstance(prediction, (list, tuple)) else (prediction if hasattr(prediction, "data") else prediction[0])
+        source_map = np.max(np.abs(stc.data), axis=1)
+        return create_graph_stc(source_map), elapsed_ms
+
+    for condition_name, evoked in evoked_conditions.items():
+        cnn_stc, cnn_time = predict_graph_on_real_evoked(evoked, "tikhonov_cnn", tikhonov_cnn_model)
+        sparse_stc, sparse_time = predict_graph_on_real_evoked(evoked, "sparse_st_graph", sparse_st_model)
+        physics_stc, physics_time = predict_graph_on_real_evoked(evoked, "full_physics_gat", physics_gat_model)
+        convdip_stc, convdip_time = predict_convdip_on_real_evoked(evoked)
+
+        all_timing_results.extend([
+            {"Seed": current_seed, "Condition": condition_name, "Algorithm": "Tikhonov-CNN", "End-to-end Inference time (ms)": cnn_time},
+            {"Seed": current_seed, "Condition": condition_name, "Algorithm": "Sparse ST-Graph", "End-to-end Inference time (ms)": sparse_time},
+            {"Seed": current_seed, "Condition": condition_name, "Algorithm": "FullPhysicsGAT", "End-to-end Inference time (ms)": physics_time},
+            {"Seed": current_seed, "Condition": condition_name, "Algorithm": "ConvDip", "End-to-end Inference time (ms)": convdip_time}
+        ])
+
+        def compute_agreement_metrics(reference_stc, predicted_stc):
+            reference_map = maximum_absolute_map(reference_stc)
+            predicted_map = maximum_absolute_map(predicted_stc)
+            spearman_r, _ = spearmanr(normalize_map(reference_map), normalize_map(predicted_map))
+            peak_distance = GEODESIC_MM[peak_index(reference_stc), peak_index(predicted_stc)]
+            return {
+                "Spearman correlation with dSPM": float(spearman_r),
+                "Cosine similarity with dSPM": cosine_similarity(reference_map, predicted_map),
+                "Normalized-map MSE vs dSPM": normalized_map_mse(reference_map, predicted_map),
+                "Peak distance from dSPM (mm)": float(peak_distance)
+            }
+
+        for algorithm_name, predicted_stc in [("Tikhonov-CNN", cnn_stc), ("Sparse ST-Graph", sparse_stc), ("FullPhysicsGAT", physics_stc), ("ConvDip", convdip_stc)]:
+            metrics = compute_agreement_metrics(reference_stc=dspm_results[condition_name], predicted_stc=predicted_stc)
+            metrics.update({"Seed": current_seed, "Condition": condition_name, "Algorithm": algorithm_name})
+            all_real_results.append(metrics)
 
 # ============================================================
-# 24. SAVE CONFIGURATION
+# FINAL OUTPUTS AND LOGGING
 # ============================================================
-package_versions = {
-    "esinet": metadata.version("esinet"),
-    "mne": metadata.version("mne"),
-    "torch": torch.__version__,
-    "torch_geometric": metadata.version("torch-geometric"),
-    "numpy": np.__version__
-}
+pd.DataFrame(all_synthetic_results).to_csv(SYNTHETIC_RESULTS_PATH, index=False)
+pd.DataFrame(all_real_results).to_csv(REAL_RESULTS_PATH, index=False)
+pd.DataFrame(all_timing_results).to_csv(REAL_TIMING_PATH, index=False)
 
-configuration = {
-    "seed": SEEDS[0], "raw_file": raw_file, "packages": package_versions,
-    "convdip_training_minutes": convdip_training_minutes, "sparse_st_training_minutes": sparse_train_mins,
-    "physics_gat_training_minutes": physics_train_mins, "tikhonov_cnn_training_minutes": cnn_train_mins
-}
+package_versions = {"esinet": metadata.version("esinet"), "mne": metadata.version("mne"), "torch": torch.__version__, "torch_geometric": metadata.version("torch-geometric"), "numpy": np.__version__}
+configuration = {"seeds": SEEDS, "raw_file": raw_file, "packages": package_versions}
 with open(CONFIG_PATH, "w", encoding="utf-8") as file: json.dump(configuration, file, ensure_ascii=False, indent=4)
 
 print("\n" + "=" * 75)
