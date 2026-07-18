@@ -22,7 +22,7 @@ from __future__ import annotations
 try:
     import IPython
     IPython.get_ipython().system('pip install -q esinet "mne>=1.7,<1.10" pandas seaborn matplotlib scikit-learn scipy torch-geometric psutil gdown')
-    IPython.get_ipython().system('gdown --folder 1NLrqimiYh-pZ1mQVrE_HXcNsX1ZyQgMu -O /content/Esinet_data')
+    IPython.get_ipython().system('gdown --folder 1yFkXxLbL8LhSbWy1hv1Ezngz5bCU0_Er -O /content/mne_data')
 except Exception:
     pass
 
@@ -68,7 +68,7 @@ mne.set_log_level("WARNING")
 class Config:
     run_mode: str = "smoke"  # smoke | pilot | full
     seeds: tuple[int, ...] = (42, 52, 62, 72, 82)
-    mne_root: str = "/content/Esinet_data/mne_data"
+    mne_root: str = "/content/mne_data"
     output_dir: str = "/content/physics_gat_final"
 
     source_spacing: str = "ico3"
