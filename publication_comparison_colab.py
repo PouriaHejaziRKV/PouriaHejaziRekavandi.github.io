@@ -148,6 +148,7 @@ SCHEDULER_PATIENCE = 7
 ACTIVE_WEIGHT = 50.0
 ACTIVE_THRESHOLD_RATIO = 0.10
 SPATIAL_LOSS_WEIGHT = 1e-4
+FORWARD_LOSS_WEIGHT = 1e-2
 
 TIKHONOV_RELATIVE_REGULARIZATION = 1e-2
 
@@ -587,7 +588,7 @@ class FullPhysicsGAT(nn.Module):
 GEODESIC_TENSOR = torch.tensor(GEODESIC_MM, dtype=torch.float32, device=device)
 LEAD_FIELD_TENSOR = torch.tensor(lead_field, dtype=torch.float32, device=device)
 
-def graph_training_loss(prediction, target, eeg_target, graph_edges, active_weight, active_threshold_ratio, spatial_weight, forward_weight=1.0):
+def graph_training_loss(prediction, target, eeg_target, graph_edges, active_weight, active_threshold_ratio, spatial_weight, forward_weight=FORWARD_LOSS_WEIGHT):
     if prediction.shape != target.shape: raise ValueError(f"Prediction shape {prediction.shape} does not match target shape {target.shape}.")
 
     waveform_loss = F.mse_loss(prediction, target)
@@ -623,23 +624,33 @@ def graph_training_loss(prediction, target, eeg_target, graph_edges, active_weig
 
     geodesic_loss = (torch.stack(geodesic_terms_p2t).mean() + torch.stack(geodesic_terms_t2p).mean()) / 2.0
 
-    reconstructed_eeg = torch.einsum("cv,bvt->bct", LEAD_FIELD_TENSOR, prediction)
+    # Forward Consistency
     prediction_physical = prediction * Y_TARGET_SCALE
     reconstructed_eeg = torch.einsum("cv,bvt->bct", LEAD_FIELD_TENSOR, prediction_physical)
-    eeg_physical = eeg_target * X_INPUT_SCALE
+    eeg_physical = eeg_target
 
     forward_loss = ((reconstructed_eeg - eeg_physical).square().mean() / eeg_physical.square().mean().clamp_min(1e-12))
 
     total = waveform_loss + map_loss + spatial_weight * edge_smoothness + 2e-3 * geodesic_loss + forward_weight * forward_loss
-    return total, waveform_loss.detach(), map_loss.detach()
+
+    components = {
+        "total": total.detach(),
+        "waveform": waveform_loss.detach(),
+        "map": map_loss.detach(),
+        "geodesic": geodesic_loss.detach(),
+        "smoothness": edge_smoothness.detach(),
+        "forward": forward_loss.detach()
+    }
+    return total, components
 
 # ============================================================
 # 12. DATA LOADERS (USING PYTORCH GEOMETRIC BATCHING)
 # ============================================================
 class PhysicsDataset(Dataset):
-    def __init__(self, x_data, y_data, build_dynamic_graph=False):
+    def __init__(self, x_data, y_data, eeg_data, build_dynamic_graph=False):
         self.x = x_data
         self.y = y_data
+        self.eeg = eeg_data
         self.build_dynamic_graph = build_dynamic_graph
 
     def __len__(self): return len(self.x)
@@ -647,6 +658,7 @@ class PhysicsDataset(Dataset):
     def __getitem__(self, idx):
         source_ts = self.x[idx]
         target = self.y[idx]
+        eeg_sample = self.eeg[idx]
 
         if self.build_dynamic_graph:
             edge_index, edge_attr = DYNAMIC_GRAPH_BUILDER(source_ts)
@@ -656,6 +668,7 @@ class PhysicsDataset(Dataset):
         return Data(
             x=torch.from_numpy(source_ts),
             y=torch.from_numpy(target),
+            eeg=torch.from_numpy(eeg_sample),
             edge_index=edge_index,
             edge_attr=edge_attr
         )
@@ -671,6 +684,8 @@ def execute_epoch(model_name, model, loader, optimizer, training):
         for batch in loader:
             batch_size = batch.num_graphs
 
+            batch_eeg = batch.eeg.reshape(batch_size, num_channels, N_TIMES).to(device, non_blocking=True)
+
             if model_name == "full_physics_gat":
                 batch = batch.to(device)
                 batch_x = batch.x.reshape(batch_size, num_vertices, N_TIMES)
@@ -684,7 +699,7 @@ def execute_epoch(model_name, model, loader, optimizer, training):
 
             if training: optimizer.zero_grad(set_to_none=True)
 
-            loss, wave_l, map_l = graph_training_loss(prediction, batch_y, batch_x, edge_index_tensor, ACTIVE_WEIGHT, ACTIVE_THRESHOLD_RATIO, SPATIAL_LOSS_WEIGHT)
+            loss, comps = graph_training_loss(prediction, batch_y, batch_eeg, edge_index_tensor, ACTIVE_WEIGHT, ACTIVE_THRESHOLD_RATIO, SPATIAL_LOSS_WEIGHT)
 
             if training:
                 loss.backward()
@@ -693,9 +708,13 @@ def execute_epoch(model_name, model, loader, optimizer, training):
 
             current_batch_size = batch_x.shape[0]
             total_loss += loss.item() * current_batch_size
-            total_wave += wave_l.item() * current_batch_size
-            total_map += map_l.item() * current_batch_size
+            total_wave += comps["waveform"].item() * current_batch_size
+            total_map += comps["map"].item() * current_batch_size
             total_samples += current_batch_size
+
+            if training and (total_samples // current_batch_size) % 100 == 0:
+                assert_finite_array("prediction", prediction)
+                assert_finite_array("loss", loss)
 
     return {"loss": total_loss / total_samples, "wave": total_wave / total_samples, "map": total_map / total_samples}
 
@@ -705,6 +724,11 @@ def execute_epoch(model_name, model, loader, optimizer, training):
 all_synthetic_results = []
 all_real_results = []
 all_timing_results = []
+
+# Ensure Y_TARGET_SCALE and X_INPUT_SCALE are populated correctly initially
+# to avoid undefined errors during extraction
+X_INPUT_SCALE = 1.0
+Y_TARGET_SCALE = 1.0
 
 for seed_idx, current_seed in enumerate(SEEDS):
     print(f"\n{'='*75}\nSTARTING PIPELINE FOR SEED {current_seed}\n{'='*75}")
@@ -783,15 +807,11 @@ for seed_idx, current_seed in enumerate(SEEDS):
     Y_source_test_ood_extent = normalize_target(Y_source_test_ood_extent)
     Y_source_test_ood_sources = normalize_target(Y_source_test_ood_sources)
 
-    train_loader_graph = PyGDataLoader(PhysicsDataset(X_source_train, Y_source_train, build_dynamic_graph=True), batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-    val_loader_graph = PyGDataLoader(PhysicsDataset(X_source_validation, Y_source_validation, build_dynamic_graph=True), batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    train_loader_graph = PyGDataLoader(PhysicsDataset(X_source_train, Y_source_train, X_eeg_train, build_dynamic_graph=True), batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader_graph = PyGDataLoader(PhysicsDataset(X_source_validation, Y_source_validation, X_eeg_validation, build_dynamic_graph=True), batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    train_loader_cnn = PyGDataLoader(PhysicsDataset(X_source_train, Y_source_train, build_dynamic_graph=False), batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-    val_loader_cnn = PyGDataLoader(PhysicsDataset(X_source_validation, Y_source_validation, build_dynamic_graph=False), batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-
-    # Clean memory of large arrays before training begins
-    del X_eeg_train, Y_source_train, X_eeg_validation, Y_source_validation
-    gc.collect()
+    train_loader_cnn = PyGDataLoader(PhysicsDataset(X_source_train, Y_source_train, X_eeg_train, build_dynamic_graph=False), batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader_cnn = PyGDataLoader(PhysicsDataset(X_source_validation, Y_source_validation, X_eeg_validation, build_dynamic_graph=False), batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
     tikhonov_cnn_model = TikhonovTemporalCNN().to(device)
     sparse_st_model = SparseSpatioTemporalGraphNet(hidden_dimension=32, dropout=0.20).to(device)
@@ -805,6 +825,7 @@ for seed_idx, current_seed in enumerate(SEEDS):
         test_batch = next(iter(train_loader_graph))
         test_x = test_batch.x.reshape(test_batch.num_graphs, num_vertices, N_TIMES).to(device)
         test_y = test_batch.y.reshape(test_batch.num_graphs, num_vertices, N_TIMES).to(device)
+        test_eeg = test_batch.eeg.reshape(test_batch.num_graphs, num_channels, N_TIMES).to(device)
         test_batch = test_batch.to(device)
 
         assert_finite_array("Smoke test batch_x", test_x)
@@ -820,7 +841,7 @@ for seed_idx, current_seed in enumerate(SEEDS):
 
         physics_gat_model.train()
         pred_physics = physics_gat_model(test_batch)
-        test_loss, _, _ = graph_training_loss(pred_physics, test_y, test_x, edge_index_tensor, ACTIVE_WEIGHT, ACTIVE_THRESHOLD_RATIO, SPATIAL_LOSS_WEIGHT)
+        test_loss, _, _ = graph_training_loss(pred_physics, test_y, test_eeg, edge_index_tensor, ACTIVE_WEIGHT, ACTIVE_THRESHOLD_RATIO, SPATIAL_LOSS_WEIGHT)
         assert_finite_array("Smoke test loss", test_loss)
         test_loss.backward()
         print("Forward and backward smoke test passed.\n")
@@ -922,73 +943,90 @@ for seed_idx, current_seed in enumerate(SEEDS):
     try: convdip_model.save(convdip_path_seed)
     except Exception: pass
 
+    # Clean memory of training sets
+    del X_eeg_train, Y_source_train, X_eeg_validation, Y_source_validation, sim_train
+    gc.collect()
+
     # ============================================================
     # SYNTHETIC EVALUATION
     # ============================================================
-    def maximum_absolute_map(stc_data): return np.max(np.abs(stc_data), axis=-1)
+    def maximum_absolute_map(value):
+        if hasattr(value, "data"): value = value.data
+        value = np.asarray(value)
+        if value.ndim == 1: return np.abs(value)
+        if value.ndim != 2: raise ValueError(f"Expected a source map [V] or a source signal [V,T], but received shape {value.shape}.")
+        return np.max(np.abs(value), axis=-1)
+
+    def map_peak_index(source_map): return int(np.argmax(np.asarray(source_map)))
+    def stc_peak_index(stc): return int(np.argmax(np.max(np.abs(stc.data), axis=1)))
+
     def normalize_map(source_map):
         source_map = np.asarray(source_map, dtype=np.float64)
         return source_map / (np.max(np.abs(source_map)) + 1e-12)
     def normalized_map_mse(first_map, second_map): return float(np.mean((normalize_map(first_map) - normalize_map(second_map)) ** 2))
     def cosine_similarity(first_map, second_map): return float(1.0 - cosine(normalize_map(first_map), normalize_map(second_map)))
-    def peak_index(stc_map): return int(np.argmax(stc_map))
 
-    def evaluate_synthetic(model_name, model, x_data, y_true, condition_name):
+    def evaluate_synthetic(model_name, model, x_data, y_true_norm, eeg_data_raw, condition_name):
         model.eval()
         with torch.no_grad():
             if model_name == "convdip":
                 temp_sim = Simulation(fwd_fixed, epochs.info.copy())
-                temp_sim.eeg_data = [mne.EvokedArray(x_data[i], epochs.info, tmin=0.0) for i in range(len(x_data))]
+                temp_sim.eeg_data = [mne.EvokedArray(eeg_data_raw[i], epochs.info, tmin=0.0) for i in range(len(eeg_data_raw))]
                 try:
                     preds_list = convdip_model.predict(temp_sim)
-                    pred = np.stack([p.data for p in preds_list], axis=0)
+                    pred_physical = np.stack([p.data for p in preds_list], axis=0)
                 except Exception as e:
                     raise RuntimeError("ConvDip prediction failed during synthetic evaluation.") from e
             else:
                 x_tensor = torch.from_numpy(x_data).to(device)
-                if model_name == "tikhonov_cnn": pred = model(x_tensor)
-                elif model_name == "sparse_st_graph": pred = model(x_tensor, sparse_adjacency)
+                if model_name == "tikhonov_cnn": pred_norm = model(x_tensor)
+                elif model_name == "sparse_st_graph": pred_norm = model(x_tensor, sparse_adjacency)
                 elif model_name == "full_physics_gat":
-                    ds = PhysicsDataset(x_data, y_true, build_dynamic_graph=True)
+                    ds = PhysicsDataset(x_data, y_true_norm, eeg_data_raw, build_dynamic_graph=True)
                     dl = PyGDataLoader(ds, batch_size=BATCH_SIZE, shuffle=False)
                     preds = []
                     for b in dl:
                         b = b.to(device)
                         preds.append(model(b))
-                    pred = torch.cat(preds, dim=0)
-                pred = pred.cpu().numpy()
+                    pred_norm = torch.cat(preds, dim=0)
+                pred_physical = pred_norm.cpu().numpy() * Y_TARGET_SCALE
 
-        if model_name == "convdip":
-            # ConvDip predicts in physical scale, so compare against unscaled physical y_true
-            mse = np.mean((pred - (y_true * Y_TARGET_SCALE))**2)
-        else:
-            mse = np.mean((pred - y_true)**2)
-        target_map = np.max(np.abs(y_true), axis=-1)
-        pred_map = np.max(np.abs(pred), axis=-1)
+        target_physical = y_true_norm * Y_TARGET_SCALE
 
-        spearman_r, _ = spearmanr(normalize_map(target_map.mean(axis=0)), normalize_map(pred_map.mean(axis=0)))
-        peak_dist = GEODESIC_MM[peak_index(target_map.mean(axis=0)), peak_index(pred_map.mean(axis=0))]
+        for sample_idx in range(len(target_physical)):
+            true_map = np.max(np.abs(target_physical[sample_idx]), axis=-1)
+            estimated_map = np.max(np.abs(pred_physical[sample_idx]), axis=-1)
 
-        all_synthetic_results.append({
-            "Seed": current_seed, "Condition": condition_name, "Algorithm": model_name,
-            "Waveform MSE": float(mse),
-            "Normalized-map MSE": normalized_map_mse(target_map.mean(axis=0), pred_map.mean(axis=0)),
-            "Cosine Similarity": cosine_similarity(target_map.mean(axis=0), pred_map.mean(axis=0)),
-            "Peak distance (mm)": float(peak_dist)
-        })
+            true_map_norm = true_map / (true_map.max() + 1e-12)
+            pred_map_norm = estimated_map / (estimated_map.max() + 1e-12)
 
-    for condition, x_val, y_val in [
-        ("ID", X_source_test_id, Y_source_test_id),
-        ("OOD-SNR", X_source_test_ood_snr, Y_source_test_ood_snr),
-        ("OOD-Extent", X_source_test_ood_extent, Y_source_test_ood_extent),
-        ("OOD-Sources", X_source_test_ood_sources, Y_source_test_ood_sources)
+            true_label = (true_map_norm >= ACTIVE_THRESHOLD_RATIO).astype(np.int64)
+            pred_label = (pred_map_norm >= ACTIVE_THRESHOLD_RATIO).astype(np.int64)
+
+            auc = roc_auc_score(true_label, estimated_map) if np.unique(true_label).size == 2 else np.nan
+            precision, recall, f1, _ = precision_recall_fscore_support(true_label, pred_label, average="binary", zero_division=0)
+
+            all_synthetic_results.append({
+                "Seed": current_seed, "Condition": condition_name, "Algorithm": model_name, "Sample": sample_idx,
+                "Waveform MSE": float(np.mean((pred_physical[sample_idx] - target_physical[sample_idx]) ** 2)),
+                "Normalized-map MSE": normalized_map_mse(true_map, estimated_map),
+                "Cosine Similarity": cosine_similarity(true_map, estimated_map),
+                "Peak distance (mm)": float(GEODESIC_MM[map_peak_index(true_map), map_peak_index(estimated_map)]),
+                "AUC": float(auc), "F1": float(f1), "Precision": float(precision), "Recall": float(recall)
+            })
+
+    for condition, x_val, y_val, eeg_val in [
+        ("ID", X_source_test_id, Y_source_test_id, X_eeg_test_id),
+        ("OOD-SNR", X_source_test_ood_snr, Y_source_test_ood_snr, X_eeg_test_ood_snr),
+        ("OOD-Extent", X_source_test_ood_extent, Y_source_test_ood_extent, X_eeg_test_ood_extent),
+        ("OOD-Sources", X_source_test_ood_sources, Y_source_test_ood_sources, X_eeg_test_ood_sources)
     ]:
-        evaluate_synthetic("tikhonov_cnn", tikhonov_cnn_model, x_val, y_val, condition)
-        evaluate_synthetic("sparse_st_graph", sparse_st_model, x_val, y_val, condition)
-        evaluate_synthetic("full_physics_gat", physics_gat_model, x_val, y_val, condition)
-        evaluate_synthetic("convdip", convdip_model, X_eeg_test_id if condition=="ID" else (X_eeg_test_ood_snr if condition=="OOD-SNR" else (X_eeg_test_ood_extent if condition=="OOD-Extent" else X_eeg_test_ood_sources)), y_val, condition)
+        evaluate_synthetic("tikhonov_cnn", tikhonov_cnn_model, x_val, y_val, eeg_val, condition)
+        evaluate_synthetic("sparse_st_graph", sparse_st_model, x_val, y_val, eeg_val, condition)
+        evaluate_synthetic("full_physics_gat", physics_gat_model, x_val, y_val, eeg_val, condition)
+        evaluate_synthetic("convdip", convdip_model, x_val, y_val, eeg_val, condition)
 
-    del sim_test_id, sim_test_ood_snr, sim_test_ood_extent, sim_test_ood_sources, sim_train
+    del sim_test_id, sim_test_ood_snr, sim_test_ood_extent, sim_test_ood_sources
     gc.collect()
 
     # ============================================================
@@ -1012,7 +1050,19 @@ for seed_idx, current_seed in enumerate(SEEDS):
         source_initialization = np.clip(source_initialization / X_INPUT_SCALE, -10.0, 10.0)
         model_input = torch.from_numpy(source_initialization).unsqueeze(0).to(device)
 
+        # Warmup
+        if model_name == "sparse_st_graph": _ = model(model_input, sparse_adjacency)
+        elif model_name == "tikhonov_cnn": _ = model(model_input)
+        else:
+            ei, ea = DYNAMIC_GRAPH_BUILDER(source_initialization)
+            ds = Data(x=model_input[0], edge_index=ei, edge_attr=ea)
+            dl = PyGDataLoader([ds], batch_size=1)
+            b = next(iter(dl)).to(device)
+            _ = model(b)
+
         if torch.cuda.is_available(): torch.cuda.synchronize()
+        start = time.perf_counter()
+
         if model_name == "sparse_st_graph": prediction_scaled = model(model_input, sparse_adjacency)
         elif model_name == "tikhonov_cnn": prediction_scaled = model(model_input)
         else:
@@ -1023,17 +1073,21 @@ for seed_idx, current_seed in enumerate(SEEDS):
             prediction_scaled = model(b)
 
         if torch.cuda.is_available(): torch.cuda.synchronize()
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
 
         source_map = prediction_scaled.abs().amax(dim=-1).squeeze(0).cpu().numpy() * Y_TARGET_SCALE
         source_map = np.maximum(source_map, 0.0)
         return create_graph_stc(source_map), elapsed_ms
 
     def predict_convdip_on_real_evoked(evoked):
-        t0 = time.perf_counter()
+        try: _ = convdip_model.predict(evoked)
+        except Exception: _ = convdip_model.predict([evoked])
+
+        start = time.perf_counter()
         try: prediction = convdip_model.predict(evoked)
         except Exception: prediction = convdip_model.predict([evoked])
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
         stc = prediction[0] if isinstance(prediction, (list, tuple)) else (prediction if hasattr(prediction, "data") else prediction[0])
         source_map = np.max(np.abs(stc.data), axis=1)
         return create_graph_stc(source_map), elapsed_ms
@@ -1055,7 +1109,7 @@ for seed_idx, current_seed in enumerate(SEEDS):
             reference_map = maximum_absolute_map(reference_stc)
             predicted_map = maximum_absolute_map(predicted_stc)
             spearman_r, _ = spearmanr(normalize_map(reference_map), normalize_map(predicted_map))
-            peak_distance = GEODESIC_MM[peak_index(reference_stc), peak_index(predicted_stc)]
+            peak_distance = GEODESIC_MM[stc_peak_index(reference_stc), stc_peak_index(predicted_stc)]
             return {
                 "Spearman correlation with dSPM": float(spearman_r),
                 "Cosine similarity with dSPM": cosine_similarity(reference_map, predicted_map),
