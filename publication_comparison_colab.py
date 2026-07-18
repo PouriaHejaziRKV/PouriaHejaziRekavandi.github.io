@@ -1,4 +1,3 @@
-from __future__ import annotations
 # -*- coding: utf-8 -*-
 # ============================================================
 # REAL MNE SAMPLE EEG:
@@ -10,18 +9,14 @@ from __future__ import annotations
 # ============================================================
 
 # %% 0 — INSTALL IN A SEPARATE COLAB CELL
-import os
-import IPython
-print("Installing dependencies...")
-IPython.get_ipython().system('pip install -q esinet mne pandas seaborn matplotlib scikit-learn torch-geometric')
+# RUN THIS CELL BEFORE THE REST OF THE SCRIPT
+# !pip install -q esinet mne pandas seaborn matplotlib scikit-learn
+# !pip install -q torch-geometric pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
 
 # %% 1 — IMPORTS AND GOOGLE DRIVE
-try:
-    from google.colab import drive
-    drive.mount("/content/drive")
-except ImportError:
-    pass
+from __future__ import annotations
 
+import os
 import glob
 import gc
 import json
@@ -32,6 +27,12 @@ import warnings
 import importlib.metadata as metadata
 import psutil
 
+try:
+    from google.colab import drive
+    drive.mount("/content/drive")
+except ImportError:
+    pass
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -40,6 +41,10 @@ import seaborn as sns
 from scipy.signal import butter, sosfiltfilt
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
+from scipy.optimize import linear_sum_assignment
+from scipy.stats import spearmanr
+from scipy.spatial.distance import cosine
+from sklearn.metrics import roc_auc_score, precision_recall_fscore_support
 
 import mne
 
@@ -47,35 +52,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.utils.data import Dataset
 
-from torch.utils.data import (
-    Dataset,
-    DataLoader,
-    TensorDataset
-)
-
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader as PyGDataLoader
 from torch_geometric.nn import GATv2Conv
 from torch_geometric.utils import add_self_loops, coalesce
-
-from scipy.stats import spearmanr
-from scipy.spatial.distance import cosine
-from sklearn.metrics import roc_auc_score, precision_recall_fscore_support
-from scipy.optimize import linear_sum_assignment
 
 from esinet import Simulation
 from esinet import Net
 
-
 warnings.filterwarnings("default")
 plt.switch_backend("agg")
-
 mne.set_log_level("WARNING")
 
 # ============================================================
 # 1. REPRODUCIBILITY AND CONFIGURATION
 # ============================================================
-
-SEED = 42
+SEEDS = (42, 52, 62, 72, 82)
 
 def set_global_seed(seed):
     random.seed(seed)
@@ -86,9 +80,9 @@ def set_global_seed(seed):
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
-set_global_seed(SEED)
-
+set_global_seed(SEEDS[0])
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def assert_finite_array(name, value):
@@ -99,7 +93,6 @@ def assert_finite_array(name, value):
         value = np.asarray(value)
         finite = bool(np.isfinite(value).all())
         shape = value.shape
-
     if not finite:
         raise RuntimeError(f"{name} contains non-finite values; shape={shape}")
 
@@ -117,9 +110,10 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 SMOKE_TEST = False
 
 SOURCE_SPACING = "ico3"
-NUM_SIMULATED_SOURCES = 3
 TARGET_SNR = 3.0
+OOD_SNR = -10.0
 SOURCE_EXTENTS = (10, 20)
+OOD_EXTENTS = (28, 42)
 
 N_TRAIN = 8 if SMOKE_TEST else 40000
 N_VALIDATION = 4 if SMOKE_TEST else 1000
@@ -131,7 +125,6 @@ MAX_EPOCHS = 1 if SMOKE_TEST else 150
 BATCH_SIZE = 2 if SMOKE_TEST else 64
 LEARNING_RATE = 2e-3
 WEIGHT_DECAY = 1e-5
-
 EARLY_STOPPING_PATIENCE = 20
 SCHEDULER_PATIENCE = 7
 
@@ -146,7 +139,6 @@ EPOCH_TMAX = 0.50
 INFERENCE_TMIN = 0.00
 INFERENCE_TMAX = 0.30
 RESAMPLE_FREQUENCY = 100.0
-N_TIMES = int(round(SIMULATION_DURATION * RESAMPLE_FREQUENCY)) + 1
 
 NONLOCAL_K = 4
 FUNCTIONAL_K = 3
@@ -156,19 +148,6 @@ DROPOUT = 0.15
 
 if HIDDEN_DIM % HEADS != 0:
     raise ValueError("The hidden dimension must be divisible by the number of attention heads.")
-
-# ------------------------------------------------------------
-# Saved files
-# ------------------------------------------------------------
-GRAPH_MODEL_PATH = os.path.join(OUTPUT_DIR, "best_sparse_st_graph_model.pt")
-PHYSICS_GAT_PATH = os.path.join(OUTPUT_DIR, "best_full_physics_gat_model.pt")
-CONVDIP_MODEL_PATH = os.path.join(OUTPUT_DIR, "convdip_real_subject_model")
-TIKHONOV_CNN_PATH = os.path.join(OUTPUT_DIR, "best_tikhonov_cnn_model.pt")
-
-TRAINING_HISTORY_PATH = os.path.join(OUTPUT_DIR, "graph_training_history.csv")
-REAL_RESULTS_PATH = os.path.join(OUTPUT_DIR, "real_data_results.csv")
-REAL_TIMING_PATH = os.path.join(OUTPUT_DIR, "real_data_inference_times.csv")
-CONFIG_PATH = os.path.join(OUTPUT_DIR, "configuration.json")
 
 # ============================================================
 # 2. DISCOVER REAL MNE SAMPLE FILES IN GOOGLE DRIVE
@@ -181,8 +160,7 @@ def find_all(patterns):
 
 def find_first(patterns):
     results = find_all(patterns)
-    if len(results) == 0:
-        return None
+    if len(results) == 0: return None
     return results[0]
 
 def find_subjects_directory(root_directory):
@@ -191,32 +169,13 @@ def find_subjects_directory(root_directory):
     for directory in possible_directories:
         sample_surf = os.path.join(directory, "sample", "surf")
         sample_mri = os.path.join(directory, "sample", "mri")
-        if os.path.isdir(sample_surf) and os.path.isdir(sample_mri):
-            return directory
+        if os.path.isdir(sample_surf) and os.path.isdir(sample_mri): return directory
     return None
 
-raw_file = find_first([
-    os.path.join(MNE_ROOT, "**", "sample_audvis_filt-0-40_raw.fif"),
-    os.path.join(MNE_ROOT, "**", "sample_audvis_raw.fif")
-])
-
-event_file = find_first([
-    os.path.join(MNE_ROOT, "**", "sample_audvis_raw-eve.fif"),
-    os.path.join(MNE_ROOT, "**", "*audvis*-eve.fif")
-])
-
-trans_file = find_first([
-    os.path.join(MNE_ROOT, "**", "sample_audvis_raw-trans.fif"),
-    os.path.join(MNE_ROOT, "**", "*audvis*-trans.fif"),
-    os.path.join(MNE_ROOT, "**", "*-trans.fif")
-])
-
-bem_file = find_first([
-    os.path.join(MNE_ROOT, "**", "sample-5120-5120-5120-bem-sol.fif"),
-    os.path.join(MNE_ROOT, "**", "sample-*-bem-sol.fif"),
-    os.path.join(MNE_ROOT, "**", "*-bem-sol.fif")
-])
-
+raw_file = find_first([os.path.join(MNE_ROOT, "**", "sample_audvis_filt-0-40_raw.fif"), os.path.join(MNE_ROOT, "**", "sample_audvis_raw.fif")])
+event_file = find_first([os.path.join(MNE_ROOT, "**", "sample_audvis_raw-eve.fif"), os.path.join(MNE_ROOT, "**", "*audvis*-eve.fif")])
+trans_file = find_first([os.path.join(MNE_ROOT, "**", "sample_audvis_raw-trans.fif"), os.path.join(MNE_ROOT, "**", "*audvis*-trans.fif"), os.path.join(MNE_ROOT, "**", "*-trans.fif")])
+bem_file = find_first([os.path.join(MNE_ROOT, "**", "sample-5120-5120-5120-bem-sol.fif"), os.path.join(MNE_ROOT, "**", "sample-*-bem-sol.fif"), os.path.join(MNE_ROOT, "**", "*-bem-sol.fif")])
 subjects_dir = find_subjects_directory(MNE_ROOT)
 
 required_files = {"Raw file": raw_file, "Transformation file": trans_file, "BEM file": bem_file, "Subjects directory": subjects_dir}
@@ -259,10 +218,8 @@ event_id = present_events
 # ============================================================
 eeg_picks = mne.pick_types(raw.info, meg=False, eeg=True, eog=False, stim=False, exclude="bads")
 epochs = mne.Epochs(
-    raw=raw, events=events, event_id=event_id,
-    tmin=EPOCH_TMIN, tmax=EPOCH_TMAX,
-    baseline=(EPOCH_TMIN, 0.0), picks=eeg_picks,
-    reject={"eeg": 150e-6}, preload=True, proj=True, detrend=1,
+    raw=raw, events=events, event_id=event_id, tmin=EPOCH_TMIN, tmax=EPOCH_TMAX,
+    baseline=(EPOCH_TMIN, 0.0), picks=eeg_picks, reject={"eeg": 150e-6}, preload=True, proj=True, detrend=1,
     reject_by_annotation=True, on_missing="warn", verbose=False
 )
 epochs.resample(RESAMPLE_FREQUENCY, npad="auto", verbose=False)
@@ -296,7 +253,6 @@ for c in evoked_conditions: evoked_conditions[c].pick(common_channels)
 
 fwd_free = mne.pick_channels_forward(fwd_free, include=common_channels, ordered=True, copy=True)
 forward_channel_order = fwd_free["info"]["ch_names"]
-
 epochs.reorder_channels(forward_channel_order)
 for c in evoked_conditions: evoked_conditions[c].reorder_channels(forward_channel_order)
 
@@ -304,13 +260,11 @@ fwd_fixed = mne.convert_forward_solution(fwd_free, surf_ori=True, force_fixed=Tr
 lead_field = np.asarray(fwd_fixed["sol"]["data"], dtype=np.float64)
 num_vertices = sum(len(src["vertno"]) for src in fwd_fixed["src"])
 num_channels = len(fwd_fixed["info"]["ch_names"])
-
 source_coordinates_mm = np.vstack([src["rr"][src["vertno"]] for src in fwd_fixed["src"]]).astype(np.float64) * 1000.0
 
 # ============================================================
 # 8. CORTICAL MESH GRAPH & PHYSICS-GAT GRAPH COMPONENTS
 # ============================================================
-
 def build_cortical_edges(forward_model):
     edge_set = set()
     offset = 0
@@ -318,7 +272,6 @@ def build_cortical_edges(forward_model):
         used_vertices = np.asarray(hemisphere["vertno"], dtype=np.int64)
         vertex_to_local = {int(v): i for i, v in enumerate(used_vertices)}
         triangles = hemisphere.get("use_tris", hemisphere.get("tris", None))
-
         for triangle in triangles:
             triangle = [int(v) for v in triangle]
             if not all(v in vertex_to_local for v in triangle): continue
@@ -328,26 +281,21 @@ def build_cortical_edges(forward_model):
                 if first_node != second_node:
                     edge_set.add(tuple(sorted((first_node, second_node))))
         offset += len(used_vertices)
-
-    if len(edge_set) == 0:
-        raise RuntimeError("The cortical graph contains no edges.")
+    if len(edge_set) == 0: raise RuntimeError("The cortical graph contains no edges.")
     return np.array(sorted(edge_set), dtype=np.int64).T
 
 edge_index_np = build_cortical_edges(fwd_fixed)
 
 def make_normalized_sparse_adjacency(edge_index, number_of_nodes, device):
-    source = edge_index[0]
-    target = edge_index[1]
+    source, target = edge_index[0], edge_index[1]
     self_nodes = np.arange(number_of_nodes, dtype=np.int64)
     rows = np.concatenate([source, target, self_nodes])
     columns = np.concatenate([target, source, self_nodes])
-    degree = np.bincount(rows, minlength=number_of_nodes).astype(np.float32)
-    degree = np.maximum(degree, 1.0)
+    degree = np.maximum(np.bincount(rows, minlength=number_of_nodes).astype(np.float32), 1.0)
     values = (1.0 / np.sqrt(degree[rows] * degree[columns])).astype(np.float32)
     indices = torch.tensor(np.vstack([rows, columns]), dtype=torch.long, device=device)
     values_tensor = torch.tensor(values, dtype=torch.float32, device=device)
-    adjacency = torch.sparse_coo_tensor(indices=indices, values=values_tensor, size=(number_of_nodes, number_of_nodes), device=device)
-    return adjacency.coalesce()
+    return torch.sparse_coo_tensor(indices=indices, values=values_tensor, size=(number_of_nodes, number_of_nodes), device=device).coalesce()
 
 sparse_adjacency = make_normalized_sparse_adjacency(edge_index_np, num_vertices, device)
 edge_index_tensor = torch.tensor(edge_index_np, dtype=torch.long, device=device)
@@ -362,10 +310,7 @@ def compute_geodesic_matrix(undirected_edges: np.ndarray, coordinates_mm: np.nda
     ).tocsr()
     distances = np.asarray(dijkstra(sparse_graph, directed=False), dtype=np.float32)
     finite_values = distances[np.isfinite(distances)]
-
-    if finite_values.size == 0:
-        raise RuntimeError("No finite geodesic distance was computed.")
-
+    if finite_values.size == 0: raise RuntimeError("No finite geodesic distance was computed.")
     distances[~np.isfinite(distances)] = finite_values.max() + 100.0
     return distances
 
@@ -373,10 +318,7 @@ GEODESIC_MM = compute_geodesic_matrix(edge_index_np, source_coordinates_mm)
 
 def make_local_edge_index() -> torch.Tensor:
     first, second = edge_index_np
-    edge_index = torch.tensor(
-        np.vstack([np.concatenate([first, second]), np.concatenate([second, first])]),
-        dtype=torch.long
-    )
+    edge_index = torch.tensor(np.vstack([np.concatenate([first, second]), np.concatenate([second, first])]), dtype=torch.long)
     edge_index, _ = add_self_loops(edge_index, num_nodes=num_vertices)
     return coalesce(edge_index, num_nodes=num_vertices)
 
@@ -388,10 +330,8 @@ def normalized_leadfield_profiles(lead_field: np.ndarray) -> np.ndarray:
     profiles /= np.linalg.norm(profiles, axis=1, keepdims=True) + 1e-8
     return profiles
 
-if not 1 <= NONLOCAL_K < num_vertices:
-    raise ValueError("NONLOCAL_K must be between 1 and V-1.")
-if not 1 <= FUNCTIONAL_K < num_vertices:
-    raise ValueError("FUNCTIONAL_K must be between 1 and V-1.")
+if not 1 <= NONLOCAL_K < num_vertices: raise ValueError("NONLOCAL_K must be between 1 and V-1.")
+if not 1 <= FUNCTIONAL_K < num_vertices: raise ValueError("FUNCTIONAL_K must be between 1 and V-1.")
 
 def create_base_graph(lead_field: np.ndarray):
     profiles = normalized_leadfield_profiles(lead_field)
@@ -423,14 +363,11 @@ def create_edge_attributes(edge_index: torch.Tensor, leadfield_profiles: np.ndar
     functional[self_mask] = 0.0
 
     values = np.column_stack([euclidean, geodesic, leadfield_similarity, functional]).astype(np.float32)
-
     if not np.isfinite(values).all():
         invalid_count = int((~np.isfinite(values)).sum())
         raise RuntimeError(f"Non-finite edge attributes detected: {invalid_count}")
-
     if values.shape != (edge_index.shape[1], 4):
         raise RuntimeError("Edge-attribute shape is inconsistent with edge_index.")
-
     return torch.from_numpy(values)
 
 class GraphBuilder:
@@ -440,8 +377,7 @@ class GraphBuilder:
         self.static_attributes = create_edge_attributes(self.base_edges, self.profiles)
 
     def __call__(self, initial_source: np.ndarray):
-        if not self.dynamic:
-            return self.base_edges, self.static_attributes
+        if not self.dynamic: return self.base_edges, self.static_attributes
         signal = initial_source - initial_source.mean(axis=1, keepdims=True)
         signal /= np.linalg.norm(signal, axis=1, keepdims=True) + 1e-8
 
@@ -466,39 +402,24 @@ DYNAMIC_GRAPH_BUILDER = GraphBuilder(lead_field, dynamic=True)
 # ============================================================
 # 9. CREATE SUBJECT-SPECIFIC TRAINING SIMULATIONS
 # ============================================================
-simulation_settings = {
-    "duration_of_trial": SIMULATION_DURATION,
-    "number_of_sources": NUM_SIMULATED_SOURCES,
-    "extents": SOURCE_EXTENTS,
-    "target_snr": TARGET_SNR
-}
-
-def make_simulation(n_samples, seed):
+def make_simulation(n_samples, seed, snr, extents, sources=3):
     set_global_seed(seed)
-    simulation = Simulation(fwd_fixed, epochs.info.copy(), settings=simulation_settings)
+    settings = {"duration_of_trial": SIMULATION_DURATION, "number_of_sources": sources, "extents": extents, "target_snr": snr}
+    simulation = Simulation(fwd_fixed, epochs.info.copy(), settings=settings)
     simulation.simulate(n_samples=n_samples)
     return simulation
 
-sim_train = make_simulation(N_TRAIN, SEED)
-sim_validation = make_simulation(N_VALIDATION, SEED + 1)
-sim_test = make_simulation(N_TEST, SEED + 2)
+sim_train = make_simulation(N_TRAIN, SEEDS[0], TARGET_SNR, SOURCE_EXTENTS, sources=NUM_SIMULATED_SOURCES)
+sim_validation = make_simulation(N_VALIDATION, SEEDS[0] + 1, TARGET_SNR, SOURCE_EXTENTS, sources=NUM_SIMULATED_SOURCES)
+
+# Independent Test Sets
+sim_test_id = make_simulation(N_TEST, SEEDS[0] + 100, TARGET_SNR, SOURCE_EXTENTS, sources=NUM_SIMULATED_SOURCES)
+sim_test_ood_snr = make_simulation(N_TEST, SEEDS[0] + 101, OOD_SNR, SOURCE_EXTENTS, sources=NUM_SIMULATED_SOURCES)
+sim_test_ood_extent = make_simulation(N_TEST, SEEDS[0] + 102, TARGET_SNR, OOD_EXTENTS, sources=NUM_SIMULATED_SOURCES)
+sim_test_ood_sources = make_simulation(N_TEST, SEEDS[0] + 103, TARGET_SNR, SOURCE_EXTENTS, sources=6)
 
 # ============================================================
-# 10. TRAIN CONVDIP
-# ============================================================
-set_global_seed(SEED)
-convdip_model = Net(fwd_fixed)
-convdip_training_start = time.time()
-convdip_model.fit(sim_train, epochs=MAX_EPOCHS, batch_size=BATCH_SIZE)
-convdip_training_minutes = (time.time() - convdip_training_start) / 60.0
-
-try:
-    convdip_model.save(CONVDIP_MODEL_PATH)
-except Exception:
-    pass
-
-# ============================================================
-# 11. DATA EXTRACTION UTILITIES
+# 10. DATA EXTRACTION UTILITIES
 # ============================================================
 def convert_to_list(data):
     if isinstance(data, list): return data
@@ -532,14 +453,28 @@ X_eeg_train = extract_eeg_collection(sim_train.eeg_data)
 Y_source_train = extract_source_full(sim_train.source_data)
 X_eeg_validation = extract_eeg_collection(sim_validation.eeg_data)
 Y_source_validation = extract_source_full(sim_validation.source_data)
-X_eeg_test = extract_eeg_collection(sim_test.eeg_data)
-Y_source_test = extract_source_full(sim_test.source_data)
+
+# Extract test sets
+def extract_test(sim):
+    return extract_eeg_collection(sim.eeg_data), extract_source_full(sim.source_data)
+
+X_eeg_test_id, Y_source_test_id = extract_test(sim_test_id)
+X_eeg_test_ood_snr, Y_source_test_ood_snr = extract_test(sim_test_ood_snr)
+X_eeg_test_ood_extent, Y_source_test_ood_extent = extract_test(sim_test_ood_extent)
+X_eeg_test_ood_sources, Y_source_test_ood_sources = extract_test(sim_test_ood_sources)
+
+N_TIMES = Y_source_train.shape[-1]
+if X_eeg_train.shape[-1] != N_TIMES: raise RuntimeError(f"Unexpected EEG time dimension: expected {N_TIMES}, received {X_eeg_train.shape[-1]}")
 
 assert_finite_array("X_eeg_train", X_eeg_train)
 assert_finite_array("Y_source_train", Y_source_train)
 
+# Clean memory
+del sim_validation, sim_test_id, sim_test_ood_snr, sim_test_ood_extent, sim_test_ood_sources
+gc.collect()
+
 # ============================================================
-# 12. REGULARIZED TIKHONOV INVERSE
+# 11. REGULARIZED TIKHONOV INVERSE
 # ============================================================
 def compute_tikhonov_inverse(forward_matrix, relative_regularization):
     K = np.asarray(forward_matrix, dtype=np.float64)
@@ -557,10 +492,13 @@ def apply_tikhonov_batch(eeg_batch, inverse_operator):
 
 X_source_train = apply_tikhonov_batch(X_eeg_train, K_dagger)
 X_source_validation = apply_tikhonov_batch(X_eeg_validation, K_dagger)
-X_source_test = apply_tikhonov_batch(X_eeg_test, K_dagger)
+X_source_test_id = apply_tikhonov_batch(X_eeg_test_id, K_dagger)
+X_source_test_ood_snr = apply_tikhonov_batch(X_eeg_test_ood_snr, K_dagger)
+X_source_test_ood_extent = apply_tikhonov_batch(X_eeg_test_ood_extent, K_dagger)
+X_source_test_ood_sources = apply_tikhonov_batch(X_eeg_test_ood_sources, K_dagger)
 
 # ============================================================
-# 13. TRAIN-ONLY NORMALIZATION
+# 12. TRAIN-ONLY NORMALIZATION
 # ============================================================
 def robust_scale(array, percentile=99.5):
     value = np.percentile(np.abs(array), percentile)
@@ -571,11 +509,53 @@ Y_TARGET_SCALE = robust_scale(Y_source_train)
 
 X_source_train = np.clip(X_source_train / X_INPUT_SCALE, -10.0, 10.0).astype(np.float32)
 X_source_validation = np.clip(X_source_validation / X_INPUT_SCALE, -10.0, 10.0).astype(np.float32)
-X_source_test = np.clip(X_source_test / X_INPUT_SCALE, -10.0, 10.0).astype(np.float32)
+X_source_test_id = np.clip(X_source_test_id / X_INPUT_SCALE, -10.0, 10.0).astype(np.float32)
 
 Y_source_train = np.clip(Y_source_train / Y_TARGET_SCALE, -10.0, 10.0).astype(np.float32)
 Y_source_validation = np.clip(Y_source_validation / Y_TARGET_SCALE, -10.0, 10.0).astype(np.float32)
-Y_source_test = np.clip(Y_source_test / Y_TARGET_SCALE, -10.0, 10.0).astype(np.float32)
+Y_source_test_id = np.clip(Y_source_test_id / Y_TARGET_SCALE, -10.0, 10.0).astype(np.float32)
+
+# ============================================================
+# 13. DATA LOADERS (USING PYTORCH GEOMETRIC BATCHING)
+# ============================================================
+class PhysicsDataset(Dataset):
+    def __init__(self, x_data, y_data, build_dynamic_graph=False):
+        self.x = x_data
+        self.y = y_data
+        self.build_dynamic_graph = build_dynamic_graph
+        self.cache = {}
+
+    def __len__(self): return len(self.x)
+
+    def __getitem__(self, idx):
+        source_ts = self.x[idx]
+        target = self.y[idx]
+
+        if self.build_dynamic_graph:
+            if idx not in self.cache:
+                edge_index, edge_attr = DYNAMIC_GRAPH_BUILDER(source_ts)
+                self.cache[idx] = (edge_index, edge_attr)
+            else:
+                edge_index, edge_attr = self.cache[idx]
+        else:
+            edge_index, edge_attr = None, None
+
+        return Data(
+            x=torch.from_numpy(source_ts),
+            y=torch.from_numpy(target),
+            edge_index=edge_index,
+            edge_attr=edge_attr
+        )
+
+# Graph datasets use PyGDataLoader, CNN uses standard
+train_dataset_graph = PhysicsDataset(X_source_train, Y_source_train, build_dynamic_graph=True)
+val_dataset_graph = PhysicsDataset(X_source_validation, Y_source_validation, build_dynamic_graph=True)
+
+train_loader_graph = PyGDataLoader(train_dataset_graph, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+val_loader_graph = PyGDataLoader(val_dataset_graph, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+train_loader_cnn = PyGDataLoader(PhysicsDataset(X_source_train, Y_source_train, build_dynamic_graph=False), batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+val_loader_cnn = PyGDataLoader(PhysicsDataset(X_source_validation, Y_source_validation, build_dynamic_graph=False), batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
 # ============================================================
 # 14. NEURAL ARCHITECTURES
@@ -708,29 +688,24 @@ class FullPhysicsGAT(nn.Module):
             nn.Linear(HIDDEN_DIM, N_TIMES)
         )
 
-    def forward_one(self, initial_source, edge_index, edge_attr):
+    def forward(self, data, *args):
+        initial_source, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
+        # initial_source: [B*V, T] natively flattened by PyG Batching
         features = self.temporal_encoder(initial_source)
         features = self.graph_block_1(features, edge_index, edge_attr)
         features = self.graph_block_2(features, edge_index, edge_attr)
-        output = self.temporal_decoder(features)
-        return output
-
-    def forward(self, initial_source, edge_indices, edge_attributes):
-        if initial_source.ndim != 3: raise ValueError("Expected initial_source with shape [B, V, T].")
-        if initial_source.shape[1] != num_vertices: raise ValueError("Unexpected number of source vertices.")
-        outputs = []
-        for i in range(len(initial_source)):
-            ei = edge_indices[i].to(initial_source.device)
-            ea = edge_attributes[i].to(initial_source.device)
-            outputs.append(self.forward_one(initial_source[i], ei, ea))
-        return torch.stack(outputs)
+        output = self.temporal_decoder(features) # [B*V, T]
+        # reshape back to [B, V, T]
+        batch_size = batch.max().item() + 1
+        return output.reshape(batch_size, num_vertices, -1)
 
 # ============================================================
 # 15. LOSS TENSORS
 # ============================================================
 GEODESIC_TENSOR = torch.tensor(GEODESIC_MM, dtype=torch.float32, device=device)
+LEAD_FIELD_TENSOR = torch.tensor(lead_field, dtype=torch.float32, device=device)
 
-def graph_training_loss(prediction, target, graph_edges, active_weight, active_threshold_ratio, spatial_weight):
+def graph_training_loss(prediction, target, graph_edges, active_weight, active_threshold_ratio, spatial_weight, forward_weight=1.0):
     if prediction.shape != target.shape: raise ValueError(f"Prediction shape {prediction.shape} does not match target shape {target.shape}.")
 
     waveform_loss = F.mse_loss(prediction, target)
@@ -747,47 +722,73 @@ def graph_training_loss(prediction, target, graph_edges, active_weight, active_t
     residual_map = predicted_map - target_map
     edge_smoothness = (residual_map[:, graph_edges[0]] - residual_map[:, graph_edges[1]]).square().mean()
 
+    # Symmetric Geodesic Loss
     probability = predicted_map / predicted_map.sum(dim=1, keepdim=True).clamp_min(1e-8)
-    geodesic_terms = []
+    target_probability = target_map / target_map.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+    geodesic_terms_p2t = []
+    geodesic_terms_t2p = []
     for i in range(len(prediction)):
         true_support = torch.where(active_target[i])[0]
-        if len(true_support) == 0:
-            true_support = target_map[i].argmax().reshape(1)
-        distance_to_true_support = GEODESIC_TENSOR[:, true_support].amin(dim=1)
-        geodesic_terms.append((probability[i] * distance_to_true_support).sum() / 100.0)
-    geodesic_loss = torch.stack(geodesic_terms).mean()
+        if len(true_support) == 0: true_support = target_map[i].argmax().reshape(1)
 
-    total = waveform_loss + map_loss + spatial_weight * edge_smoothness + 2e-3 * geodesic_loss
+        pred_support = torch.where(predicted_map[i] >= active_threshold_ratio * predicted_map[i].max().clamp_min(1e-8))[0]
+        if len(pred_support) == 0: pred_support = predicted_map[i].argmax().reshape(1)
+
+        d_p2t = GEODESIC_TENSOR[:, true_support].amin(dim=1)
+        d_t2p = GEODESIC_TENSOR[:, pred_support].amin(dim=1)
+
+        geodesic_terms_p2t.append((probability[i] * d_p2t).sum() / 100.0)
+        geodesic_terms_t2p.append((target_probability[i] * d_t2p).sum() / 100.0)
+
+    geodesic_loss = (torch.stack(geodesic_terms_p2t).mean() + torch.stack(geodesic_terms_t2p).mean()) / 2.0
+
+    # Forward Consistency
+    reconstructed_eeg = torch.einsum("cv,bvt->bct", LEAD_FIELD_TENSOR, prediction)
+    target_eeg = torch.einsum("cv,bvt->bct", LEAD_FIELD_TENSOR, target)
+    forward_loss = F.mse_loss(reconstructed_eeg, target_eeg)
+
+    total = waveform_loss + map_loss + spatial_weight * edge_smoothness + 2e-3 * geodesic_loss + forward_weight * forward_loss
     return total, waveform_loss.detach(), map_loss.detach()
 
 # ============================================================
-# 16. DATA LOADERS
+# 16. SMOKE TEST VALIDATION
 # ============================================================
-class PhysicsDataset(Dataset):
-    def __init__(self, x_data, y_data):
-        self.x = x_data
-        self.y = y_data
-    def __len__(self): return len(self.x)
-    def __getitem__(self, idx):
-        source_ts = self.x[idx]
-        target = self.y[idx]
-        edge_index, edge_attr = DYNAMIC_GRAPH_BUILDER(source_ts)
-        return {"x": torch.from_numpy(source_ts), "y": torch.from_numpy(target), "edge_index": edge_index, "edge_attr": edge_attr}
+tikhonov_cnn_model = TikhonovTemporalCNN().to(device)
+sparse_st_model = SparseSpatioTemporalGraphNet(hidden_dimension=32, dropout=0.20).to(device)
+physics_gat_model = FullPhysicsGAT().to(device)
 
-def collate_physics(batch):
-    return {
-        "x": torch.stack([b["x"] for b in batch]),
-        "y": torch.stack([b["y"] for b in batch]),
-        "edge_index": [b["edge_index"] for b in batch],
-        "edge_attr": [b["edge_attr"] for b in batch],
-        "adjacency": sparse_adjacency # For sparse model
-    }
+print("\n" + "=" * 75)
+print("EXECUTING SMOKE TEST")
+print("=" * 75)
 
-train_dataset = PhysicsDataset(X_source_train, Y_source_train)
-validation_dataset = PhysicsDataset(X_source_validation, Y_source_validation)
+test_batch = next(iter(train_loader_graph))
+test_x, test_y = test_batch.x.reshape(-1, num_vertices, N_TIMES).to(device), test_batch.y.reshape(-1, num_vertices, N_TIMES).to(device)
+test_batch = test_batch.to(device)
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, pin_memory=torch.cuda.is_available(), num_workers=0, collate_fn=collate_physics)
-validation_loader = DataLoader(validation_dataset, batch_size=BATCH_SIZE, shuffle=False, pin_memory=torch.cuda.is_available(), num_workers=0, collate_fn=collate_physics)
+assert_finite_array("Smoke test batch_x", test_x)
+assert_finite_array("Smoke test batch_y", test_y)
+
+with torch.no_grad():
+    # Test Physics GAT (PyG Batched)
+    pred_physics = physics_gat_model(test_batch)
+    assert_finite_array("Smoke test PhysicsGAT prediction", pred_physics)
+
+    # Test Sparse ST
+    pred_sparse = sparse_st_model(test_x, sparse_adjacency)
+    assert_finite_array("Smoke test SparseST prediction", pred_sparse)
+
+    # Test CNN
+    pred_cnn = tikhonov_cnn_model(test_x)
+    assert_finite_array("Smoke test CNN prediction", pred_cnn)
+
+# Test Backward
+physics_gat_model.train()
+pred_physics = physics_gat_model(test_batch)
+test_loss, _, _ = graph_training_loss(pred_physics, test_y, edge_index_tensor, ACTIVE_WEIGHT, ACTIVE_THRESHOLD_RATIO, SPATIAL_LOSS_WEIGHT)
+assert_finite_array("Smoke test loss", test_loss)
+test_loss.backward()
+print("Forward and backward smoke test passed.\n")
 
 # ============================================================
 # 17. TRAIN NEURAL MODELS
@@ -801,14 +802,19 @@ def execute_epoch(model_name, model, loader, optimizer, training):
 
     with context:
         for batch in loader:
-            batch_x = batch["x"].to(device, non_blocking=True)
-            batch_y = batch["y"].to(device, non_blocking=True)
+            if model_name == "full_physics_gat":
+                batch = batch.to(device)
+                batch_x = batch.x.reshape(-1, num_vertices, N_TIMES)
+                batch_y = batch.y.reshape(-1, num_vertices, N_TIMES)
+            else:
+                batch_x = batch.x.to(device, non_blocking=True)
+                batch_y = batch.y.to(device, non_blocking=True)
 
             if training: optimizer.zero_grad(set_to_none=True)
 
-            if model_name == "sparse_st_graph": prediction = model(batch_x, batch["adjacency"])
+            if model_name == "sparse_st_graph": prediction = model(batch_x, sparse_adjacency)
             elif model_name == "tikhonov_cnn": prediction = model(batch_x)
-            else: prediction = model(batch_x, batch["edge_index"], batch["edge_attr"])
+            else: prediction = model(batch)
 
             loss, wave_l, map_l = graph_training_loss(prediction, batch_y, edge_index_tensor, ACTIVE_WEIGHT, ACTIVE_THRESHOLD_RATIO, SPATIAL_LOSS_WEIGHT)
 
@@ -825,7 +831,7 @@ def execute_epoch(model_name, model, loader, optimizer, training):
 
     return {"loss": total_loss / total_samples, "wave": total_wave / total_samples, "map": total_map / total_samples}
 
-def train_model_loop(model_name, model, save_path):
+def train_model_loop(model_name, model, loader_train, loader_val, save_path):
     print(f"\n{'='*75}\nTRAINING: {model_name.upper()}\n{'='*75}")
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=SCHEDULER_PATIENCE, min_lr=1e-6)
@@ -833,13 +839,26 @@ def train_model_loop(model_name, model, save_path):
     history = []
     best_validation_loss = float("inf")
     epochs_without_improvement = 0
+    start_epoch = 1
     start_time = time.time()
 
     last_save_path = save_path.replace("best", "last")
 
-    for epoch in range(1, MAX_EPOCHS + 1):
-        train_stats = execute_epoch(model_name, model, train_loader, optimizer, training=True)
-        val_stats = execute_epoch(model_name, model, validation_loader, optimizer, training=False)
+    # Resume Checkpointing Logic
+    if os.path.exists(last_save_path):
+        chkpt = torch.load(last_save_path, map_location=device, weights_only=False)
+        model.load_state_dict(chkpt["model_state_dict"])
+        optimizer.load_state_dict(chkpt["optimizer_state_dict"])
+        scheduler.load_state_dict(chkpt["scheduler_state_dict"])
+        start_epoch = chkpt["epoch"] + 1
+        best_validation_loss = chkpt["best_validation_loss"]
+        epochs_without_improvement = chkpt["epochs_without_improvement"]
+        history = chkpt.get("history", [])
+        print(f"Resumed from epoch {start_epoch - 1}")
+
+    for epoch in range(start_epoch, MAX_EPOCHS + 1):
+        train_stats = execute_epoch(model_name, model, loader_train, optimizer, training=True)
+        val_stats = execute_epoch(model_name, model, loader_val, optimizer, training=False)
 
         validation_loss = val_stats["loss"]
         scheduler.step(validation_loss)
@@ -853,7 +872,9 @@ def train_model_loop(model_name, model, save_path):
 
         improved = validation_loss < best_validation_loss - 1e-7
         checkpoint_data = {
-            "model_state_dict": model.state_dict(), "epoch": epoch, "validation_loss": validation_loss,
+            "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(), "epoch": epoch,
+            "best_validation_loss": best_validation_loss, "epochs_without_improvement": epochs_without_improvement,
             "input_scale": X_INPUT_SCALE, "target_scale": Y_TARGET_SCALE,
             "channel_names": epochs.ch_names, "vertices": [fwd_fixed["src"][0]["vertno"], fwd_fixed["src"][1]["vertno"]],
             "history": history
@@ -878,39 +899,95 @@ def train_model_loop(model_name, model, save_path):
     training_minutes = (time.time() - start_time) / 60.0
     print(f"{model_name} training time: {training_minutes:.2f} minutes")
 
-    checkpoint = torch.load(save_path, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    if os.path.exists(save_path):
+        checkpoint = torch.load(save_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-    print(f"Loaded best {model_name} checkpoint from epoch:", checkpoint["epoch"])
-
     return history, training_minutes
 
-tikhonov_cnn_model = TikhonovTemporalCNN().to(device)
-sparse_st_model = SparseSpatioTemporalGraphNet(hidden_dimension=32, dropout=0.20).to(device)
-physics_gat_model = FullPhysicsGAT().to(device)
-
-cnn_history, cnn_train_mins = train_model_loop("tikhonov_cnn", tikhonov_cnn_model, TIKHONOV_CNN_PATH)
-sparse_history, sparse_train_mins = train_model_loop("sparse_st_graph", sparse_st_model, GRAPH_MODEL_PATH)
-physics_history, physics_train_mins = train_model_loop("full_physics_gat", physics_gat_model, PHYSICS_GAT_PATH)
+cnn_history, cnn_train_mins = train_model_loop("tikhonov_cnn", tikhonov_cnn_model, train_loader_cnn, val_loader_cnn, TIKHONOV_CNN_PATH)
+sparse_history, sparse_train_mins = train_model_loop("sparse_st_graph", sparse_st_model, train_loader_cnn, val_loader_cnn, GRAPH_MODEL_PATH)
+physics_history, physics_train_mins = train_model_loop("full_physics_gat", physics_gat_model, train_loader_graph, val_loader_graph, PHYSICS_GAT_PATH)
 
 pd.DataFrame(sparse_history).to_csv(TRAINING_HISTORY_PATH, index=False)
 pd.DataFrame(physics_history).to_csv(os.path.join(OUTPUT_DIR, "physics_gat_history.csv"), index=False)
 pd.DataFrame(cnn_history).to_csv(os.path.join(OUTPUT_DIR, "tikhonov_cnn_history.csv"), index=False)
 
-# SMOKE TEST VERIFICATION
-if SMOKE_TEST:
-    test_item = train_dataset[0]
-    assert_finite_array("test x", test_item["x"])
-    assert_finite_array("test y", test_item["y"])
-    assert_finite_array("test edge_attr", test_item["edge_attr"])
+# ============================================================
+# 18. TRAIN CONVDIP
+# ============================================================
+print("\n" + "=" * 75)
+print("TRAINING: CONVDIP")
+print("=" * 75)
 
-    with torch.no_grad():
-        test_pred = physics_gat_model(test_item["x"][None].to(device), [test_item["edge_index"]], [test_item["edge_attr"]])
-    assert_finite_array("test prediction", test_pred)
-    print("Smoke test passed.")
+set_global_seed(SEEDS[0])
+convdip_model = Net(fwd_fixed)
+convdip_training_start = time.time()
+convdip_model.fit(sim_train, epochs=MAX_EPOCHS, batch_size=BATCH_SIZE)
+convdip_training_minutes = (time.time() - convdip_training_start) / 60.0
+
+try:
+    convdip_model.save(CONVDIP_MODEL_PATH)
+except Exception:
+    pass
 
 # ============================================================
-# 18. dSPM CLASSICAL INVERSE ON REAL EEG
+# 19. SYNTHETIC EVALUATION METRICS
+# ============================================================
+def synthetic_eval(model_name, model, x_data, y_true):
+    model.eval()
+    with torch.no_grad():
+        x_tensor = torch.from_numpy(x_data).to(device)
+        if model_name == "tikhonov_cnn": pred = model(x_tensor)
+        elif model_name == "sparse_st_graph": pred = model(x_tensor, sparse_adjacency)
+        elif model_name == "full_physics_gat":
+            # For test evaluation, loop through or build one big PyG batch
+            ds = PhysicsDataset(x_data, y_true, build_dynamic_graph=True)
+            dl = PyGDataLoader(ds, batch_size=BATCH_SIZE, shuffle=False)
+            preds = []
+            for b in dl:
+                preds.append(model(b.to(device)))
+            pred = torch.cat(preds, dim=0)
+        else: # ConvDip
+            # Evaluate ConvDip natively on synthetic test sets
+            import mne
+            from esinet import Simulation
+
+            # Reconstruct temporary Simulation obj to pass to ConvDip for fair processing
+            temp_sim = Simulation(fwd_fixed, epochs.info.copy())
+            temp_sim.eeg_data = [mne.EvokedArray(x_data[i], epochs.info, tmin=0.0) for i in range(len(x_data))]
+            temp_sim.source_data = [mne.SourceEstimate(y_true[i], vertices=[fwd_fixed["src"][0]["vertno"], fwd_fixed["src"][1]["vertno"]], tmin=0.0, tstep=1.0) for i in range(len(y_true))]
+
+            try:
+                preds_list = convdip_model.predict(temp_sim)
+                pred_arrays = [p.data for p in preds_list]
+                pred = torch.from_numpy(np.stack(pred_arrays, axis=0))
+            except Exception:
+                pred = torch.zeros_like(torch.from_numpy(y_true))
+
+    pred_np = pred.cpu().numpy()
+
+    target_map = np.max(np.abs(y_true), axis=-1)
+    pred_map = np.max(np.abs(pred_np), axis=-1)
+
+    mse = np.mean((pred_np - y_true)**2)
+    return mse
+
+print("\nSynthetic Test ID MSE:")
+print(f"CNN: {synthetic_eval('tikhonov_cnn', tikhonov_cnn_model, X_source_test_id, Y_source_test_id):.6f}")
+print(f"SparseST: {synthetic_eval('sparse_st_graph', sparse_st_model, X_source_test_id, Y_source_test_id):.6f}")
+print(f"PhysicsGAT: {synthetic_eval('full_physics_gat', physics_gat_model, X_source_test_id, Y_source_test_id):.6f}")
+
+print("\nSynthetic Test OOD-SNR MSE:")
+print(f"CNN: {synthetic_eval('tikhonov_cnn', tikhonov_cnn_model, X_source_test_ood_snr, Y_source_test_ood_snr):.6f}")
+print(f"SparseST: {synthetic_eval('sparse_st_graph', sparse_st_model, X_source_test_ood_snr, Y_source_test_ood_snr):.6f}")
+print(f"PhysicsGAT: {synthetic_eval('full_physics_gat', physics_gat_model, X_source_test_ood_snr, Y_source_test_ood_snr):.6f}")
+
+del sim_train
+gc.collect()
+
+# ============================================================
+# 20. dSPM CLASSICAL INVERSE ON REAL EEG
 # ============================================================
 print("\n" + "=" * 75)
 print("PHASE 6: COMPUTING REAL EEG dSPM REFERENCE")
@@ -925,7 +1002,7 @@ for condition_name, evoked in evoked_conditions.items():
     dspm_results[condition_name] = mne.minimum_norm.apply_inverse(evoked, dspm_inverse_operator, lambda2=lambda2, method="dSPM", pick_ori=None, verbose=False)
 
 # ============================================================
-# 19. INFERENCE UTILITIES
+# 21. INFERENCE UTILITIES
 # ============================================================
 def create_graph_stc(source_map):
     return mne.SourceEstimate(data=source_map[:, np.newaxis], vertices=[fwd_fixed["src"][0]["vertno"], fwd_fixed["src"][1]["vertno"]], tmin=0.0, tstep=1.0, subject="sample")
@@ -944,7 +1021,10 @@ def predict_graph_on_real_evoked(evoked, model_name, model):
     elif model_name == "tikhonov_cnn": prediction_scaled = model(model_input)
     else:
         edge_index, edge_attr = DYNAMIC_GRAPH_BUILDER(source_initialization)
-        prediction_scaled = model(model_input, [edge_index], [edge_attr])
+        ds = Data(x=model_input[0], edge_index=edge_index, edge_attr=edge_attr)
+        dl = PyGDataLoader([ds], batch_size=1)
+        b = next(iter(dl)).to(device)
+        prediction_scaled = model(b)
 
     if torch.cuda.is_available(): torch.cuda.synchronize()
     elapsed_ms = (time.perf_counter() - start) * 1000.0
@@ -970,7 +1050,7 @@ def predict_convdip_on_real_evoked(evoked):
     return create_graph_stc(source_map), elapsed_ms
 
 # ============================================================
-# 20. RUN ALL NEURAL INVERSE METHODS ON REAL EEG
+# 22. RUN ALL NEURAL INVERSE METHODS ON REAL EEG
 # ============================================================
 print("\n" + "=" * 75)
 print("PHASE 7: NEURAL INVERSE ON REAL EEG")
@@ -979,6 +1059,7 @@ print("=" * 75)
 cnn_results, sparse_results, physics_results, convdip_results = {}, {}, {}, {}
 timing_rows = []
 
+# Warmups
 first_evoked = next(iter(evoked_conditions.values()))
 _ = predict_graph_on_real_evoked(first_evoked, "tikhonov_cnn", tikhonov_cnn_model)
 _ = predict_graph_on_real_evoked(first_evoked, "sparse_st_graph", sparse_st_model)
@@ -1008,7 +1089,7 @@ timing_df = pd.DataFrame(timing_rows)
 timing_df.to_csv(REAL_TIMING_PATH, index=False)
 
 # ============================================================
-# 21. REAL-DATA AGREEMENT METRICS
+# 23. REAL-DATA AGREEMENT METRICS
 # ============================================================
 def maximum_absolute_map(stc): return np.max(np.abs(stc.data), axis=1)
 
@@ -1053,7 +1134,7 @@ print("\nReal-data agreement with dSPM:")
 print(real_results_df.round(4))
 
 # ============================================================
-# 26. SAVE CONFIGURATION
+# 24. SAVE CONFIGURATION
 # ============================================================
 package_versions = {
     "esinet": metadata.version("esinet"),
@@ -1064,7 +1145,7 @@ package_versions = {
 }
 
 configuration = {
-    "seed": SEED, "raw_file": raw_file, "packages": package_versions,
+    "seed": SEEDS[0], "raw_file": raw_file, "packages": package_versions,
     "convdip_training_minutes": convdip_training_minutes, "sparse_st_training_minutes": sparse_train_mins,
     "physics_gat_training_minutes": physics_train_mins, "tikhonov_cnn_training_minutes": cnn_train_mins
 }
