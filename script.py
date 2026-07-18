@@ -21,7 +21,8 @@ from __future__ import annotations
 
 try:
     import IPython
-    IPython.get_ipython().system('pip install -q esinet "mne>=1.7,<1.10" pandas seaborn matplotlib scikit-learn scipy torch-geometric psutil')
+    IPython.get_ipython().system('pip install -q esinet "mne>=1.7,<1.10" pandas seaborn matplotlib scikit-learn scipy torch-geometric psutil gdown')
+    IPython.get_ipython().system('gdown --folder 1NLrqimiYh-pZ1mQVrE_HXcNsX1ZyQgMu -O /content/Esinet_data')
 except Exception:
     pass
 
@@ -62,19 +63,13 @@ from torch_geometric.utils import add_self_loops, coalesce
 warnings.filterwarnings("default")
 mne.set_log_level("WARNING")
 
-try:
-    from google.colab import drive
-    drive.mount("/content/drive")
-except ImportError:
-    pass
-
 
 @dataclass
 class Config:
     run_mode: str = "smoke"  # smoke | pilot | full
     seeds: tuple[int, ...] = (42, 52, 62, 72, 82)
-    mne_root: str = "/content/drive/MyDrive/Esinet/mne_data"
-    output_dir: str = "/content/drive/MyDrive/Esinet/physics_gat_final"
+    mne_root: str = "/content/Esinet_data/mne_data"
+    output_dir: str = "/content/physics_gat_final"
 
     source_spacing: str = "ico3"
     sfreq: float = 100.0
