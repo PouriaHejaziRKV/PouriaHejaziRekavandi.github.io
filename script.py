@@ -22,7 +22,7 @@ from __future__ import annotations
 try:
     import IPython
     IPython.get_ipython().system('pip install -q esinet "mne>=1.7,<1.10" pandas seaborn matplotlib scikit-learn scipy torch-geometric psutil gdown')
-    IPython.get_ipython().system('gdown --folder 1yFkXxLbL8LhSbWy1hv1Ezngz5bCU0_Er -O /content/mne_data')
+    IPython.get_ipython().system('gdown --folder 1yFkXxLbL8LhSbWy1hv1Ezngz5bCU0_Er -O /content/mne_data --remaining-ok')
 except Exception:
     pass
 
