@@ -715,31 +715,32 @@ def train_model(name: str, model: nn.Module, train_loader: PyGDataLoader,
         checkpoint = torch.load(last_path, map_location=DEVICE,
                                 weights_only=False)
         if checkpoint["hash"] != configuration_hash:
-            raise RuntimeError(f"Incompatible checkpoint: {last_path}")
-        model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        scheduler.load_state_dict(checkpoint["scheduler"])
-        start_epoch = checkpoint["epoch"] + 1
-        stale, best = checkpoint["stale"], checkpoint["best"]
-        history = checkpoint.get("history", [])
-        random.setstate(checkpoint["python_rng"])
-        np.random.set_state(checkpoint["numpy_rng"])
+            warnings.warn(f"Incompatible checkpoint found and ignored (hash mismatch): {last_path}")
+        else:
+            model.load_state_dict(checkpoint["model"])
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            scheduler.load_state_dict(checkpoint["scheduler"])
+            start_epoch = checkpoint["epoch"] + 1
+            stale, best = checkpoint["stale"], checkpoint["best"]
+            history = checkpoint.get("history", [])
+            random.setstate(checkpoint["python_rng"])
+            np.random.set_state(checkpoint["numpy_rng"])
 
-        # Ensure we always pass ByteTensor
-        torch_rng = checkpoint["torch_rng"]
-        if hasattr(torch_rng, "cpu"):
-            torch_rng = torch_rng.cpu()
-        if hasattr(torch_rng, "byte"):
-            torch_rng = torch_rng.byte()
-        torch.set_rng_state(torch_rng)
+            # Ensure we always pass ByteTensor
+            torch_rng = checkpoint["torch_rng"]
+            if hasattr(torch_rng, "cpu"):
+                torch_rng = torch_rng.cpu()
+            if hasattr(torch_rng, "byte"):
+                torch_rng = torch_rng.byte()
+            torch.set_rng_state(torch_rng)
 
-        if torch.cuda.is_available() and checkpoint["cuda_rng"] is not None:
-            cuda_rngs = []
-            for s in checkpoint["cuda_rng"]:
-                if hasattr(s, "cpu"): s = s.cpu()
-                if hasattr(s, "byte"): s = s.byte()
-                cuda_rngs.append(s)
-            torch.cuda.set_rng_state_all(cuda_rngs)
+            if torch.cuda.is_available() and checkpoint["cuda_rng"] is not None:
+                cuda_rngs = []
+                for s in checkpoint["cuda_rng"]:
+                    if hasattr(s, "cpu"): s = s.cpu()
+                    if hasattr(s, "byte"): s = s.byte()
+                    cuda_rngs.append(s)
+                torch.cuda.set_rng_state_all(cuda_rngs)
 
     started = time.time()
     for epoch in range(start_epoch, RUN["epochs"] + 1):
