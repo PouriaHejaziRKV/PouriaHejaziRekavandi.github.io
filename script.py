@@ -21,8 +21,13 @@ from __future__ import annotations
 
 try:
     import IPython
-    IPython.get_ipython().system('pip install -q esinet "mne>=1.7,<1.10" pandas seaborn matplotlib scikit-learn scipy torch-geometric psutil gdown')
-    IPython.get_ipython().system('gdown --folder 1yFkXxLbL8LhSbWy1hv1Ezngz5bCU0_Er -O /content/mne_data --remaining-ok')
+    IPython.get_ipython().system('pip install -q esinet "mne>=1.7,<1.10" pandas seaborn matplotlib scikit-learn scipy torch-geometric psutil')
+except Exception:
+    pass
+
+try:
+    from google.colab import drive
+    drive.mount("/content/drive")
 except Exception:
     pass
 
@@ -68,8 +73,8 @@ mne.set_log_level("WARNING")
 class Config:
     run_mode: str = "smoke"  # smoke | pilot | full
     seeds: tuple[int, ...] = (42, 52, 62, 72, 82)
-    mne_root: str = "/content/mne_data"
-    output_dir: str = "/content/physics_gat_final"
+    mne_root: str = "/content/drive/MyDrive/Esinet/mne_data"
+    output_dir: str = "/content/drive/MyDrive/Esinet/physics_gat_final"
 
     source_spacing: str = "ico3"
     sfreq: float = 100.0
@@ -184,6 +189,13 @@ def find_subjects_dir(root: str) -> Optional[str]:
 
 
 seed_all(RUN["seeds"][0])
+
+
+# Download MNE sample dataset if needed
+try:
+    mne.datasets.sample.data_path(path=CFG.mne_root, download=True, verbose=False)
+except Exception as e:
+    print(f"Warning: Failed to download MNE sample dataset: {e}")
 
 raw_file = find_first([
     os.path.join(CFG.mne_root, "**", "sample_audvis_filt-0-40_raw.fif"),
