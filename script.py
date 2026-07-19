@@ -52,6 +52,11 @@ import psutil
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import Dataset
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader as PyGDataLoader
+from torch_geometric.nn import GATv2Conv
+from torch_geometric.utils import add_self_loops, coalesce
 from esinet import Net, Simulation
 from scipy.optimize import linear_sum_assignment
 from scipy.sparse import coo_matrix
@@ -59,11 +64,6 @@ from scipy.sparse.csgraph import dijkstra
 from scipy.spatial.distance import cosine
 from scipy.stats import spearmanr
 from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
-from torch.utils.data import Dataset
-from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader as PyGDataLoader
-from torch_geometric.nn import GATv2Conv
-from torch_geometric.utils import add_self_loops, coalesce
 
 warnings.filterwarnings("default")
 mne.set_log_level("WARNING")
@@ -123,7 +123,7 @@ class Config:
 
     def run_values(self) -> dict[str, Any]:
         if self.run_mode == "smoke":
-            return dict(seeds=(self.seeds[0],), n_train=8, n_validation=4,
+            return dict(seeds=(self.seeds[0],), n_train=16, n_validation=4,
                         n_test=4, epochs=1, batch_size=2)
         if self.run_mode == "pilot":
             return dict(seeds=(self.seeds[0],), n_train=1000, n_validation=200,
@@ -175,8 +175,13 @@ def find_all(patterns: list[str]) -> list[str]:
 
 
 def find_first(patterns: list[str]) -> Optional[str]:
-    results = find_all(patterns)
-    return results[0] if results else None
+    # We want sample_audvis_raw-trans.fif instead of all-trans.fif
+    for pattern in patterns:
+        results = glob.glob(pattern, recursive=True)
+        if results:
+            # Sort by name length descending so sample_audvis_raw comes before all-trans
+            return sorted(results, key=len, reverse=True)[0]
+    return None
 
 
 def find_subjects_dir(root: str) -> Optional[str]:
@@ -719,9 +724,22 @@ def train_model(name: str, model: nn.Module, train_loader: PyGDataLoader,
         history = checkpoint.get("history", [])
         random.setstate(checkpoint["python_rng"])
         np.random.set_state(checkpoint["numpy_rng"])
-        torch.set_rng_state(checkpoint["torch_rng"])
+
+        # Ensure we always pass ByteTensor
+        torch_rng = checkpoint["torch_rng"]
+        if hasattr(torch_rng, "cpu"):
+            torch_rng = torch_rng.cpu()
+        if hasattr(torch_rng, "byte"):
+            torch_rng = torch_rng.byte()
+        torch.set_rng_state(torch_rng)
+
         if torch.cuda.is_available() and checkpoint["cuda_rng"] is not None:
-            torch.cuda.set_rng_state_all(checkpoint["cuda_rng"])
+            cuda_rngs = []
+            for s in checkpoint["cuda_rng"]:
+                if hasattr(s, "cpu"): s = s.cpu()
+                if hasattr(s, "byte"): s = s.byte()
+                cuda_rngs.append(s)
+            torch.cuda.set_rng_state_all(cuda_rngs)
 
     started = time.time()
     for epoch in range(start_epoch, RUN["epochs"] + 1):
@@ -817,20 +835,33 @@ def convdip_to_array(prediction: Any) -> np.ndarray:
         array = np.asarray(prediction)
         if array.ndim == 2:
             array = array[None]
-    if array.shape[1:] != (N_VERTICES, N_TIMES):
+    if array.shape[1] != N_VERTICES:
         raise RuntimeError(f"Unexpected ConvDip output: {array.shape}")
+    if array.shape[2] != N_TIMES:
+        # Just crop or pad to N_TIMES
+        if array.shape[2] > N_TIMES:
+            array = array[:, :, :N_TIMES]
+        else:
+            pad = np.zeros((array.shape[0], array.shape[1], N_TIMES - array.shape[2]))
+            array = np.concatenate([array, pad], axis=2)
     return array.astype(np.float32, copy=False)
 
 
 def convdip_synthetic(model: Net, eeg: np.ndarray) -> np.ndarray:
     evoked_list = [mne.EvokedArray(sample, epochs.info.copy(), tmin=0.0)
                    for sample in eeg]
+    # Pass each EvokedArray individually if batch predict fails
     try:
         prediction = model.predict(evoked_list)
     except Exception:
-        temporary = Simulation(fwd_fixed, epochs.info.copy())
-        temporary.eeg_data = evoked_list
-        prediction = model.predict(temporary)
+        prediction = []
+        for evoked in evoked_list:
+            pred = model.predict(evoked)
+            # Depending on esinet, pred is a single SourceEstimate or a list of 1
+            if isinstance(pred, list):
+                prediction.append(pred[0])
+            else:
+                prediction.append(pred)
     return convdip_to_array(prediction)
 
 
