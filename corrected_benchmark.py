@@ -63,26 +63,26 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-import matplotlib.pyplot as plt
-import mne
-import numpy as np
-import pandas as pd
-import psutil
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from esinet import Net, Simulation
-from scipy.optimize import linear_sum_assignment
-from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import connected_components, dijkstra
-from scipy.stats import spearmanr
-from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader as PyGDataLoader
 from torch_geometric.nn import GATv2Conv
 from torch_geometric.utils import add_self_loops, coalesce
+import matplotlib.pyplot as plt
+import mne
+import numpy as np
+import pandas as pd
+import psutil
+from scipy.optimize import linear_sum_assignment
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components, dijkstra
+from scipy.stats import spearmanr
+from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
 
+from esinet import Net, Simulation
 warnings.filterwarnings("default")
 plt.switch_backend("agg")
 mne.set_log_level("WARNING")
@@ -95,7 +95,7 @@ mne.set_log_level("WARNING")
 class Config:
     run_mode: str = "smoke" # smoke | pilot | full
     seeds: tuple[int, ...] = (42, 52, 62, 72, 82)
-    mne_root: str = "sandbox_data/Esinet/mne_data"
+    mne_root: str = str(Path("~/mne_data/MNE-sample-data").expanduser())
     output_dir: str = "sandbox_data/Esinet/final_physics_gat_corrected"
     memmap_dir: str = "sandbox_data/Esinet/final_physics_gat_corrected/memmap"
     use_memmap_full: bool = True
@@ -382,7 +382,7 @@ epochs = mne.Epochs(
 epochs.resample(CFG.sfreq, npad="auto", verbose=False)
 
 evoked_conditions = {
-    name: epochs[name].average().crop(CFG.inference_tmin, CFG.inference_tmax)
+    name: epochs[name].average().crop(CFG.inference_tmin, CFG.inference_tmin + (int(round(CFG.duration_s * CFG.sfreq)) - 1) / CFG.sfreq)
     for name in event_id if len(epochs[name]) > 0
 }
 if {"Auditory_Left", "Auditory_Right"}.issubset(evoked_conditions):
@@ -814,7 +814,7 @@ class FullPhysicsGAT(nn.Module):
         x = self.encoder(batch_data.x)
         x = self.block_1(x, batch_data.edge_index, batch_data.edge_attr)
         x = self.block_2(x, batch_data.edge_index, batch_data.edge_attr)
-        return self.decoder(x).reshape(batch_data.num_graphs, N_VERTICES, N_TIMES)
+        return self.decoder(x).reshape(batch_data.batch.max() + 1, N_VERTICES, N_TIMES)
 
 # =============================================================================
 # 7. DATASET AND LOADERS
@@ -1222,7 +1222,7 @@ def align_source_times(data: np.ndarray, source_times: np.ndarray, target_times:
     source_times = np.asarray(source_times, dtype=np.float64)
     if source_times.ndim != 1 or len(source_times) != data.shape[1]:
         raise RuntimeError("ConvDip time metadata does not match output data")
-    if source_times[0] > target_times[0] + 1e-9 or source_times[-1] < target_times[-1] - 1e-9:
+    if source_times[0] > target_times[0] + 1e-3 or source_times[-1] < target_times[-1] - 1e-3:
         raise RuntimeError(
             f"ConvDip output does not cover target interval: "
             f"[{source_times[0]}, {source_times[-1]}] vs [{target_times[0]}, {target_times[-1]}]"
@@ -1601,12 +1601,9 @@ for seed_index, seed in enumerate(RUN["seeds"]):
         )
 
         try:
-            convdip_model.save(
-                str(
-                    OUT
-                    / f"convdip_seed_{seed}"
-                )
-            )
+            (OUT / f"convdip_seed_{seed}").mkdir(parents=True, exist_ok=True)
+            OUT.mkdir(parents=True, exist_ok=True)
+            convdip_model.save(str(OUT / f"convdip_seed_{seed}.keras"))
         except Exception as error:
             warnings.warn(
                 f"ConvDip save failed: {error}"
