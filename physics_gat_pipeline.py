@@ -709,21 +709,25 @@ def train_model(name: str, model: nn.Module, train_loader: PyGDataLoader,
     history = []
 
     if CFG.resume and last_path.exists():
-        checkpoint = torch.load(last_path, map_location=DEVICE,
-                                weights_only=False)
-        if checkpoint["hash"] != configuration_hash:
-            raise RuntimeError(f"Incompatible checkpoint: {last_path}")
-        model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        scheduler.load_state_dict(checkpoint["scheduler"])
-        start_epoch = checkpoint["epoch"] + 1
-        stale, best = checkpoint["stale"], checkpoint["best"]
-        history = checkpoint.get("history", [])
-        random.setstate(checkpoint["python_rng"])
-        np.random.set_state(checkpoint["numpy_rng"])
-        torch.set_rng_state(checkpoint["torch_rng"])
-        if torch.cuda.is_available() and checkpoint["cuda_rng"] is not None:
-            torch.cuda.set_rng_state_all(checkpoint["cuda_rng"])
+        try:
+            checkpoint = torch.load(last_path, map_location=DEVICE,
+                                    weights_only=False)
+            if checkpoint.get("hash") != configuration_hash:
+                warnings.warn(f"Incompatible checkpoint hash found in {last_path}. Starting fresh.")
+            else:
+                model.load_state_dict(checkpoint["model"])
+                optimizer.load_state_dict(checkpoint["optimizer"])
+                scheduler.load_state_dict(checkpoint["scheduler"])
+                start_epoch = checkpoint["epoch"] + 1
+                stale, best = checkpoint["stale"], checkpoint["best"]
+                history = checkpoint.get("history", [])
+                random.setstate(checkpoint["python_rng"])
+                np.random.set_state(checkpoint["numpy_rng"])
+                torch.set_rng_state(checkpoint["torch_rng"])
+                if torch.cuda.is_available() and checkpoint.get("cuda_rng") is not None:
+                    torch.cuda.set_rng_state_all(checkpoint["cuda_rng"])
+        except Exception as e:
+            warnings.warn(f"Failed to load checkpoint {last_path}: {e}. Starting fresh.")
 
     started = time.time()
     for epoch in range(start_epoch, RUN["epochs"] + 1):
