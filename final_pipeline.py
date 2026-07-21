@@ -30,6 +30,18 @@ import warnings
 from pathlib import Path
 from contextlib import nullcontext
 
+# IMPORTANT: torch and torch_geometric must be imported before esinet/tensorflow to prevent segmentation faults
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+try:
+    import torch_geometric
+except ImportError:
+    pass
+import tensorflow as tf
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -41,12 +53,6 @@ from scipy.sparse.csgraph import dijkstra
 from sklearn.metrics import roc_auc_score, average_precision_score
 
 import mne
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import tensorflow as tf
 import esinet
 from esinet import Simulation, Net
 
@@ -191,8 +197,8 @@ for name, value in {
         raise FileNotFoundError(f"Missing {name} under {ROOT}")
     print(name, value)
 
-os.environ["SUBJECTS_DIR"] = subjects_dir
-mne.set_config("SUBJECTS_DIR", subjects_dir, set_env=True)
+os.environ["SUBJECTS_DIR"] = str(subjects_dir)
+mne.set_config("SUBJECTS_DIR", str(subjects_dir), set_env=True)
 
 raw_full = mne.io.read_raw_fif(raw_file, preload=True, verbose=False)
 raw = raw_full.copy().pick(picks=["eeg", "eog", "stim"], exclude="bads")
@@ -291,7 +297,7 @@ evokeds = make_evokeds(epochs)
 src = mne.setup_source_space(
     CFG["subject"],
     spacing=CFG["spacing"],
-    subjects_dir=subjects_dir,
+    subjects_dir=str(subjects_dir),
     add_dist=False,
     verbose=False,
 )
@@ -1322,22 +1328,22 @@ serializable_cfg["extents"] = list(serializable_cfg["extents"])
     json.dumps(
         {
             **serializable_cfg,
-            "raw_file": raw_file,
-            "trans_file": trans_file,
-            "bem_file": bem_file,
-            "subjects_dir": subjects_dir,
-            "channels": n_channels,
-            "vertices": n_vertices,
+            "raw_file": str(raw_file),
+            "trans_file": str(trans_file),
+            "bem_file": str(bem_file),
+            "subjects_dir": str(subjects_dir),
+            "channels": int(n_channels),
+            "vertices": int(n_vertices),
             "edges": int(edge_np.shape[1]),
-            "effective_regularization": effective_regularization,
+            "effective_regularization": float(effective_regularization),
             "scales": {
-                "input": X_SCALE,
-                "target": Y_SCALE,
-                "eeg": EEG_SCALE,
+                "input": float(X_SCALE),
+                "target": float(Y_SCALE),
+                "eeg": float(EEG_SCALE),
             },
             "best_graph_epoch": int(checkpoint["epoch"]),
-            "convdip_training_minutes": convdip_training_minutes,
-            "graph_training_minutes": graph_training_minutes,
+            "convdip_training_minutes": float(convdip_training_minutes),
+            "graph_training_minutes": float(graph_training_minutes),
             "convdip_audit": convdip_audit,
         },
         ensure_ascii=False,
