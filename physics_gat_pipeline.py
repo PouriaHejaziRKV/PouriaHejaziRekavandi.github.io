@@ -43,7 +43,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader as PyGDataLoader
-from torch_geometric.nn import GATv2Conv, SAGPooling, knn_interpolate
+from torch_geometric.nn import GATv2Conv, SAGPooling
 from torch_geometric.utils import add_self_loops, coalesce
 
 import mne
@@ -599,6 +599,9 @@ class PhysicsGAT(nn.Module):
         self.block2 = GATBlock()
         self.decoder = nn.Linear(CFG.hidden, N_TIMES)
 
+        # Zero initialize bias so un-selected nodes naturally predict 0 activity
+        nn.init.zeros_(self.decoder.bias)
+
     def forward(self, batch: Data) -> torch.Tensor:
         counts = torch.bincount(batch.batch)
         if not torch.all(counts == N_VERTICES):
@@ -607,25 +610,23 @@ class PhysicsGAT(nn.Module):
         x = self.encoder(batch.x)
         x = self.block1(x, batch.edge_index, batch.edge_attr)
 
-        # Save original positions and batch indices for interpolation later
-        pos_original = batch.pos
-        batch_original = batch.batch
-
         # Pool the graph (reduces nodes by 50%)
         x_pool, edge_index_pool, edge_attr_pool, batch_pool, perm, _ = self.pool(
             x, batch.edge_index, edge_attr=batch.edge_attr, batch=batch.batch
         )
-        pos_pool = pos_original[perm]
 
         # Second GAT operates on the reduced graph
         x_pool = self.block2(x_pool, edge_index_pool, edge_attr_pool)
 
-        # Map the reduced representation back to the full brain resolution using k-NN
-        x_unpooled = knn_interpolate(
-            x_pool, pos_pool, pos_original, batch_x=batch_pool, batch_y=batch_original, k=3
-        )
+        # Decode temporal signals for the surviving active nodes
+        decoded_pool = self.decoder(x_pool)
 
-        return self.decoder(x_unpooled).reshape(batch.num_graphs, N_VERTICES, N_TIMES)
+        # Map the reduced representation back to the full brain resolution
+        # by zero-padding the dropped nodes (native PyTorch, no pyg-lib required)
+        out = torch.zeros(batch.num_nodes, N_TIMES, device=x.device, dtype=x.dtype)
+        out[perm] = decoded_pool
+
+        return out.reshape(batch.num_graphs, N_VERTICES, N_TIMES)
 
 
 SPATIAL_EDGES = torch.tensor(
