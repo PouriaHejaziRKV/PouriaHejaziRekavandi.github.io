@@ -143,6 +143,8 @@ CFG = Config()
 RUN = CFG.run_values()
 OUT = Path(CFG.output_dir)
 OUT.mkdir(parents=True, exist_ok=True)
+STC_DIR = OUT / "stc"
+STC_DIR.mkdir(parents=True, exist_ok=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 if CFG.hidden % CFG.heads != 0:
@@ -476,32 +478,47 @@ def extract_simulation(sim: Simulation) -> tuple[np.ndarray, np.ndarray]:
     return eeg, source
 
 
+
+def save_stc(data_array: np.ndarray, evoked: mne.Evoked, algorithm: str, condition: str):
+    vertices = [fwd_fixed["src"][0]["vertno"], fwd_fixed["src"][1]["vertno"]]
+    tstep = evoked.times[1] - evoked.times[0] if len(evoked.times) > 1 else 1.0 / CFG.sfreq
+    stc = mne.SourceEstimate(
+        data=data_array,
+        vertices=vertices,
+        tmin=evoked.times[0],
+        tstep=tstep,
+        subject="sample"
+    )
+    stc.save(str(STC_DIR / f"{algorithm}_{condition}"), overwrite=True)
+
 class SourceDataset(Dataset):
-    def __init__(self, initial: np.ndarray, target: np.ndarray,
-                 physical_eeg: np.ndarray, graph: bool):
-        self.initial = initial
+    def __init__(self, eeg: np.ndarray, target: np.ndarray,
+                 graph: bool, input_scale: float):
+        self.eeg = eeg
         self.target = target
-        self.physical_eeg = physical_eeg
         self.graph = graph
-        self.lead_field = LEAD_FIELD.T  # Transpose to (N_VERTICES, N_CHANNELS)
+        self.input_scale = input_scale
+        self.lead_field = LEAD_FIELD.T
 
     def __len__(self) -> int:
-        return len(self.initial)
+        return len(self.eeg)
 
     def __getitem__(self, index: int) -> Data:
-        edge_index, edge_attr = (GRAPH_BUILDER(self.initial[index])
+        # Calculate Tikhonov on the fly to save RAM (40000 samples * 5120 vertices takes 50GB if pre-computed)
+        eeg_sample = self.eeg[index]
+        initial_raw = TIKHONOV_OPERATOR @ eeg_sample
+        initial = np.clip(initial_raw / self.input_scale, -10, 10).astype(np.float32)
+
+        edge_index, edge_attr = (GRAPH_BUILDER(initial)
                                  if self.graph else (None, None))
 
-        # Concatenate time points and spatial sensor mapping (lead field)
-        # self.initial[index] has shape (N_VERTICES, N_TIMES)
-        # self.lead_field has shape (N_VERTICES, N_CHANNELS)
-        node_features = np.concatenate([self.initial[index], self.lead_field], axis=1)
+        node_features = np.concatenate([initial, self.lead_field], axis=1)
 
         return Data(x=torch.from_numpy(node_features),
                     y=torch.from_numpy(self.target[index]),
-                    eeg=torch.from_numpy(self.physical_eeg[index]),
+                    eeg=torch.from_numpy(eeg_sample),
                     edge_index=edge_index, edge_attr=edge_attr,
-                    pos=torch.from_numpy(COORDINATES_MM))  # Added pos for unpooling
+                    pos=torch.from_numpy(COORDINATES_MM))
 
 
 class TemporalEncoder(nn.Module):
@@ -907,40 +924,37 @@ for seed_index, seed in enumerate(RUN["seeds"]):
     validation_eeg, validation_target_raw = extract_simulation(validation_sim)
     test_raw = {name: extract_simulation(sim) for name, sim in test_sims.items()}
 
-    train_initial_raw = np.einsum("vc,bct->bvt", TIKHONOV_OPERATOR,
-                                  train_eeg, optimize=True).astype(np.float32)
-    validation_initial_raw = np.einsum("vc,bct->bvt", TIKHONOV_OPERATOR,
-                                       validation_eeg, optimize=True).astype(np.float32)
-    test_initial_raw = {name: np.einsum("vc,bct->bvt", TIKHONOV_OPERATOR, eeg,
-                                        optimize=True).astype(np.float32)
-                        for name, (eeg, _) in test_raw.items()}
+    # Calculate scales using a smaller subset to avoid 50GB RAM crash on full dataset
+    subset_size = min(len(train_eeg), 2000)
+    subset_eeg = train_eeg[:subset_size]
+    subset_initial_raw = np.einsum("vc,bct->bvt", TIKHONOV_OPERATOR, subset_eeg, optimize=True).astype(np.float32)
 
-    input_scale = max(float(np.percentile(np.abs(train_initial_raw), 99.5)), 1e-12)
+    input_scale = max(float(np.percentile(np.abs(subset_initial_raw), 99.5)), 1e-12)
     target_scale = max(float(np.percentile(np.abs(train_target_raw), 99.5)), 1e-12)
-    normalize_initial = lambda x: np.clip(x / input_scale, -10, 10).astype(np.float32)
+
     normalize_target = lambda x: np.clip(x / target_scale, -10, 10).astype(np.float32)
 
-    train_initial, validation_initial = normalize_initial(train_initial_raw), normalize_initial(validation_initial_raw)
-    train_target, validation_target = normalize_target(train_target_raw), normalize_target(validation_target_raw)
-    test_initial = {name: normalize_initial(value) for name, value in test_initial_raw.items()}
+    train_target = normalize_target(train_target_raw)
+    validation_target = normalize_target(validation_target_raw)
     test_target = {name: normalize_target(source) for name, (_, source) in test_raw.items()}
 
-    graph_train = PyGDataLoader(SourceDataset(train_initial, train_target,
-                                               train_eeg, True),
+
+    graph_train = PyGDataLoader(SourceDataset(train_eeg, train_target,
+                                               True, input_scale),
                                 batch_size=RUN["batch_size"], shuffle=True,
                                 num_workers=0)
-    graph_validation = PyGDataLoader(SourceDataset(validation_initial,
+    graph_validation = PyGDataLoader(SourceDataset(validation_eeg,
                                                     validation_target,
-                                                    validation_eeg, True),
+                                                    True, input_scale),
                                      batch_size=RUN["batch_size"], shuffle=False,
                                      num_workers=0)
-    plain_train = PyGDataLoader(SourceDataset(train_initial, train_target,
-                                               train_eeg, False),
+    plain_train = PyGDataLoader(SourceDataset(train_eeg, train_target,
+                                               False, input_scale),
                                 batch_size=RUN["batch_size"], shuffle=True,
                                 num_workers=0)
-    plain_validation = PyGDataLoader(SourceDataset(validation_initial,
+    plain_validation = PyGDataLoader(SourceDataset(validation_eeg,
                                                     validation_target,
-                                                    validation_eeg, False),
+                                                    False, input_scale),
                                      batch_size=RUN["batch_size"], shuffle=False,
                                      num_workers=0)
 
@@ -992,7 +1006,8 @@ for seed_index, seed in enumerate(RUN["seeds"]):
             convdip_model = None
 
     for condition, (physical_eeg, target_raw) in test_raw.items():
-        initial = test_initial[condition]
+        initial_raw = np.einsum("vc,bct->bvt", TIKHONOV_OPERATOR, physical_eeg, optimize=True).astype(np.float32)
+        initial = np.clip(initial_raw / input_scale, -10, 10).astype(np.float32)
         target_normalized = test_target[condition]
         predictions = {}
 
@@ -1005,8 +1020,8 @@ for seed_index, seed in enumerate(RUN["seeds"]):
         with torch.no_grad():
             predictions["tikhonov_cnn"] = trained["tikhonov_cnn"](source_tensor).cpu().numpy() * target_scale
             predictions["sparse_graph"] = trained["sparse_graph"](source_tensor).cpu().numpy() * target_scale
-            loader = PyGDataLoader(SourceDataset(initial, target_normalized,
-                                                  physical_eeg, True),
+            loader = PyGDataLoader(SourceDataset(physical_eeg, target_normalized,
+                                                  True, input_scale),
                                    batch_size=RUN["batch_size"], shuffle=False,
                                    num_workers=0)
             graph_outputs = [trained["physics_gat"](batch.to(DEVICE)).cpu().numpy()
@@ -1058,8 +1073,10 @@ for seed_index, seed in enumerate(RUN["seeds"]):
                     output = model(source_tensor)
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
+                raw_data = output[0].cpu().numpy() * target_scale
+                save_stc(raw_data, evoked, algorithm, condition)
                 predictions[algorithm] = (
-                    output.abs().amax(-1)[0].cpu().numpy() * target_scale,
+                    np.max(np.abs(raw_data), axis=1),
                     preprocess_ms + (time.perf_counter() - started) * 1000.0,
                 )
 
@@ -1076,8 +1093,10 @@ for seed_index, seed in enumerate(RUN["seeds"]):
                 output = trained["physics_gat"](gat_batch)
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
+            gat_raw_data = output[0].cpu().numpy() * target_scale
+            save_stc(gat_raw_data, evoked, "physics_gat", condition)
             predictions["physics_gat"] = (
-                output.abs().amax(-1)[0].cpu().numpy() * target_scale,
+                np.max(np.abs(gat_raw_data), axis=1),
                 preprocess_ms + (time.perf_counter() - started) * 1000.0,
             )
 
@@ -1086,7 +1105,9 @@ for seed_index, seed in enumerate(RUN["seeds"]):
                 started = time.perf_counter()
                 convdip_prediction = convdip_model.predict(evoked)
                 convdip_ms = (time.perf_counter() - started) * 1000.0
-                convdip_map = np.max(np.abs(convdip_to_array(convdip_prediction)[0]), axis=1)
+                cd_array = convdip_to_array(convdip_prediction)[0]
+                save_stc(cd_array, evoked, "convdip", condition)
+                convdip_map = np.max(np.abs(cd_array), axis=1)
                 predictions["convdip"] = (convdip_map, convdip_ms)
 
             for algorithm, (prediction_map, total_ms) in predictions.items():
